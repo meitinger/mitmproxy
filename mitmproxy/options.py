@@ -181,5 +181,10 @@ class Options(optmanager.OptManager):
             TLS key size for certificates and CA.
             """
         )
+        self.add_option(
+            "quic", bool, True,
+            "Enable/disable QUIC support. "
+            "QUIC support is enabled by default.",
+        )
 
         self.update(**kwargs)

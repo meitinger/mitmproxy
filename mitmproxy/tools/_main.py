@@ -130,6 +130,9 @@ def run(
                     await asyncio.sleep(0.2)
             asyncio.ensure_future(wakeup())
 
+        if pconf.options.quic:
+            loop.run_until_complete(proxy.quicServer(pconf, master.channel))
+
         master.run()
     except exceptions.OptionsError as e:
         print("%s: %s" % (sys.argv[0], e), file=sys.stderr)

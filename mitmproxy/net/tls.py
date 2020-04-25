@@ -86,6 +86,14 @@ class MasterSecretLogger:
     # required for functools.wraps, which pyOpenSSL uses.
     __name__ = "MasterSecretLogger"
 
+    def _ensure_f(self) -> None:
+        if not self.f:
+            d = os.path.dirname(self.filename)
+            if not os.path.isdir(d):
+                os.makedirs(d)
+            self.f = open(self.filename, "ab")
+            self.f.write(b"\r\n")   
+
     def __call__(self, connection, where, ret):
         done_now = (
             where == SSL.SSL_CB_HANDSHAKE_DONE and ret == 1
@@ -100,12 +108,7 @@ class MasterSecretLogger:
         )
         if done_now or done_previously_but_not_logged_yet:
             with self.lock:
-                if not self.f:
-                    d = os.path.dirname(self.filename)
-                    if not os.path.isdir(d):
-                        os.makedirs(d)
-                    self.f = open(self.filename, "ab")
-                    self.f.write(b"\r\n")
+                self._ensure_f()
                 try:
                     client_random = binascii.hexlify(connection.client_random())
                     masterkey = binascii.hexlify(connection.master_key())
@@ -116,6 +119,16 @@ class MasterSecretLogger:
                     self.f.flush()
                     if hasattr(connection, "_still_needs_masterkey"):
                         delattr(connection, "_still_needs_masterkey")
+
+    def write(self, s: str) -> int:
+        with self.lock:
+            self._ensure_f()
+            return self.f.write(s.encode())
+
+    def flush(self) -> None:
+        with self.lock:
+            if self.f:
+                self.f.flush()
 
     def close(self):
         with self.lock:
