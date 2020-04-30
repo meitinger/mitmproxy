@@ -3,6 +3,7 @@ import enum
 import functools
 import queue
 import socket
+import sys
 import time
 import threading
 import traceback
@@ -185,7 +186,11 @@ class ConnectionProtocol(QuicConnectionProtocol):
         self._http: Optional[HttpConnection] = None
         self._flow_conn_name: str = conn_name
         self._flow_meta_id: str = conn_name + "_stream_id"
-        self.proxy: ProxyContext = proxy
+        self._events: asyncio.Queue[QuicEvent] = asyncio.Queue()
+        self.context: ProxyContext = proxy
+        
+        # schedule message pump
+        asyncio.ensure_future(self._dispatcher(), self._loop)
 
     @property
     def address(self) -> Tuple[str, int]:
@@ -196,10 +201,81 @@ class ConnectionProtocol(QuicConnectionProtocol):
         if address is not None:
             raise PermissionError
 
-    def _handle_http_event(self, event: H3Event) -> None:
+    async def _dispatcher(self) -> None:
+        event: H3Event = None
+        while not isinstance(event, ConnectionTerminated):
+            event = await self._events.get()
+            try:
+                try:
+                    if isinstance(event, HandshakeCompleted):
+                        await self.on_handshake_completed(event)
+                    elif isinstance(event, ConnectionTerminated):
+                        await self.on_connection_terminated(
+                            event.error_code, event.reason_phrase
+                        )
+                    elif isinstance(event, StreamReset):
+                        await self._handle_stream_reset(event)
+
+                    # forward to http connection if established
+                    if self._http is not None:
+                        for http_event in self._http.handle_event(event):
+                            await self._handle_http_event(http_event)
+                except FlowException as exc:
+                    await self._handle_flow_exception(exc)
+                except ProtocolError as exc:
+                    self._quic.close(
+                        error_code=exc.error_code, reason_phrase=exc.reason_phrase
+                    )
+                    self.transmit()
+                except Exception as exc:
+                    self.log(
+                        LogLevel.error,
+                        "Uncaught exception.",
+                        {"error": repr(exc), "stacktrace": traceback.format_stack()},
+                    )
+            except:
+                traceback.print_exc(file=sys.stderr)
+
+    async def _handle_flow_exception(self, exc: FlowException) -> None:
+        # ensure a stream id is set
+        flow = exc.flow
+        stream_id = flow.metadata[self._flow_meta_id]
+        self.log(
+            LogLevel.warn, exc.message, {"live": flow.live, "stream_id": stream_id},
+        )
+        assert stream_id is not None
+
+        # report the error
+        if not flow.live:
+            return
+        flow.error = baseflow.Error(str(exc))
+        await self.context.ask("error", flow)
+        if not flow.live:
+            return
+
+        # send and error and close the flow
+        if self._http is not None:
+            try:
+                self._http.send_headers(
+                    stream_id,
+                    [
+                        (b":status", exc.status),
+                        (b"server", SERVER_NAME.encode()),
+                        (b"date", formatdate(time.time(), usegmt=True).encode()),
+                    ],
+                    end_stream=True,
+                )
+            except FrameUnexpected:
+                pass
+            else:
+                self.transmit()
+        flow.live = False
+        await self.on_flow_ended(flow, exc.status, False)
+
+    async def _handle_http_event(self, event: H3Event) -> None:
         flow: http.HTTPFlow
         if isinstance(event, HeadersReceived) and event.stream_id not in self._flows:
-            flow = http.HTTPFlow(None, None, True, self.proxy.mode)
+            flow = http.HTTPFlow(None, None, True, self.context.mode.name)
             setattr(flow, self._flow_conn_name, self)
             flow.metadata[self._flow_meta_id] = event.stream_id
             self._flows[event.stream_id] = flow
@@ -219,9 +295,14 @@ class ConnectionProtocol(QuicConnectionProtocol):
                     {"event": event.__name__, "stream_id": event.stream_id},
                 )
             flow = self._flows[event.stream_id]
-        self.on_flow_http_event(flow, event)
+        try:
+            await self.on_flow_http_event(flow, event)
+        finally:
+            if event.stream_ended and flow.live:
+                flow.live = False
+                await self.on_flow_ended(flow, QuicErrorCode.NO_ERROR, True)
 
-    def _handle_stream_reset(self, event: StreamReset)->None:
+    async def _handle_stream_reset(self, event: StreamReset) -> None:
         if event.stream_id not in self._flows:
             return self.log(
                 LogLevel.debug,
@@ -231,49 +312,19 @@ class ConnectionProtocol(QuicConnectionProtocol):
         flow = self._flows[event.stream_id]
         if flow.live:
             flow.live = False
-            self.on_flow_ended(flow, event.error_code, True)
+            await self.on_flow_ended(flow, event.error_code, True)
 
-    def flow_create_stream(self, flow: http.HTTPFlow) -> int:
+    async def flow_create_stream(
+        self, flow: http.HTTPFlow, is_unidirectional: bool = False
+    ) -> int:
         assert getattr(flow, self._flow_conn_name) is None
         setattr(flow, self._flow_conn_name, self)
-        stream_id = self._quic.get_next_available_stream_id()
+        stream_id = self._quic.get_next_available_stream_id(is_unidirectional)
         flow.metadata[self._flow_meta_id] = stream_id
+        self._flows[stream_id] = flow
         return stream_id
 
-    def flow_handle_exception(self, exc: FlowException) -> None:
-        # ensure a stream id is set
-        flow = exc.flow
-        stream_id = flow.metadata[self._flow_meta_id]
-        self.log(
-            LogLevel.warn,
-            exc.message,
-            {"live": flow.live, "stream_id": stream_id},
-        )
-        assert stream_id is not None
-
-        # close the flow if it is still live
-        if flow.live:
-            flow.error = baseflow.Error(str(exc))
-            self.proxy.tell("error", flow)
-            if self._http is not None:
-                try:
-                    self._http.send_headers(
-                        stream_id,
-                        [
-                            (b":status", exc.status),
-                            (b"server", SERVER_NAME.encode()),
-                            (b"date", formatdate(time.time(), usegmt=True).encode()),
-                        ],
-                        end_stream=True
-                    )
-                except FrameUnexpected:
-                    pass
-                else:
-                    self.transmit()
-            flow.live = False
-            self.on_flow_ended(flow, exc.status, False)
-
-    def flow_send(
+    async def flow_send(
         self,
         flow: http.HTTPFlow,
         headers: Optional[Headers] = None,
@@ -297,7 +348,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
             self.transmit()
         if end_flow:
             flow.live = False
-            self.on_flow_ended(flow, QuicErrorCode.NO_ERROR, False)
+            await self.on_flow_ended(flow, QuicErrorCode.NO_ERROR, False)
 
     def log(
         self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
@@ -306,19 +357,22 @@ class ConnectionProtocol(QuicConnectionProtocol):
             msg = ("\n" + " " * 7).join(
                 [msg] + [f"{name}: {value}" for (name, value) in additional.items()]
             )
-        self.proxy.tell("log", log.LogEntry(self.log_format(msg), level.name))
+        self.context.tell("log", log.LogEntry(self.log_format(msg), level.name))
 
     def log_format(self, msg: str) -> str:
+        # should be overridden in subclass
         return msg
 
-    def on_connection_terminated(self, error_code: int, reason_phrase: str) -> None:
+    async def on_connection_terminated(
+        self, error_code: int, reason_phrase: str
+    ) -> None:
         self.log(
             LogLevel.info if error_code == QuicErrorCode.NO_ERROR else LogLevel.warn,
             "Connection closed.",
             {"error_code": error_code, "reason_phrase": reason_phrase},
         )
 
-    def on_handshake_completed(self, event: HandshakeCompleted) -> None:
+    async def on_handshake_completed(self, event: HandshakeCompleted) -> None:
         # set the proper http connection
         if event.alpn_protocol.startswith("h3-"):
             self._http = H3Connection(self._quic)
@@ -332,28 +386,16 @@ class ConnectionProtocol(QuicConnectionProtocol):
         self.tls_established = True
         self.tls_version = "TLSv1.3"
 
-    def on_flow_http_event(self, flow: http.HTTPFlow, event: H3Event) -> None:
+    async def on_flow_ended(
+        self, flow: http.HTTPFlow, error_code: int, by_remote: bool
+    ) -> None:
         pass
 
-    def on_flow_ended(self, flow: http.HTTPFlow, error_code: int, by_remote: bool) -> None:
+    async def on_flow_http_event(self, flow: http.HTTPFlow, event: H3Event) -> None:
         pass
 
     def quic_event_received(self, event: QuicEvent) -> None:
-        try:
-            if isinstance(event, HandshakeCompleted):
-                self.on_handshake_completed(event)
-            elif isinstance(event, ConnectionTerminated):
-                self.on_connection_terminated(event.error_code, event.reason_phrase)
-            elif isinstance(event, StreamReset):
-                self._handle_stream_reset(event)
-
-            # forward to http connection if established
-            if self._http is not None:
-                for http_event in self._http.handle_event(event):
-                    self._handle_http_event(http_event)
-        except ProtocolError as exc:
-            self._quic.close(error_code=exc.error_code, reason_phrase=exc.reason_phrase)
-            self.transmit()
+        self._events.put_nowait(event)
 
 
 class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
@@ -373,9 +415,9 @@ class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
     def log_format(self, msg: str) -> str:
         return f"[QUIC-out] {self.source_address[0]}:{self.source_address[1]} -> {self.address[0]}:{self.address[1]}: {msg}"
 
-    def on_handshake_completed(self, event: HandshakeCompleted) -> None:
-        super().on_handshake_completed(event)
-        self.cert = self.proxy.convert_certificate(event.certificates[0])
+    async def on_handshake_completed(self, event: HandshakeCompleted) -> None:
+        await super().on_handshake_completed(event)
+        self.cert = self.context.convert_certificate(event.certificates[0])
 
 
 class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
@@ -454,16 +496,16 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         self, authority: Optional[Tuple[str, int]] = None
     ) -> OutgoingProtocol:
         if authority is None:
-            if self.proxy.mode is ProxyMode.regular:
+            if self.context.mode is ProxyMode.regular:
                 raise ValueError(
                     "Parameter authority must not be None for regular proxies."
                 )
             elif (
-                self.proxy.mode is ProxyMode.upstream
-                or self.proxy.mode is ProxyMode.reverse
+                self.context.mode is ProxyMode.upstream
+                or self.context.mode is ProxyMode.reverse
             ):
-                authority = self.proxy.upstream_or_reverse_address
-            elif self.proxy.mode is ProxyMode.transparent:
+                authority = self.context.upstream_or_reverse_address
+            elif self.context.mode is ProxyMode.transparent:
                 authority = self.server
             else:
                 raise NotImplementedError
@@ -481,9 +523,9 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         )
 
         # create the outgoing connection if the destination is known and it's necessary
-        if self.proxy.mode is not ProxyMode.regular and (
-            self.proxy.options.upstream_cert
-            or self.proxy.options.add_upstream_certs_to_client_chain
+        if self.context.mode is not ProxyMode.regular and (
+            self.context.options.upstream_cert
+            or self.context.options.add_upstream_certs_to_client_chain
         ):
             asyncio.run_coroutine_threadsafe(
                 self._ensure_default_outgoing_protocol(), self._loop
@@ -500,12 +542,12 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
 
         # add the name of server name of the reverse target or upstream proxy
         if (
-            self.proxy.mode is ProxyMode.upstream
-            or self.proxy.mode is ProxyMode.reverse
+            self.context.mode is ProxyMode.upstream
+            or self.context.mode is ProxyMode.reverse
         ):
-            upstream_or_reverse_host = self.proxy.upstream_or_reverse_address[0].encode(
-                "idna"
-            )
+            upstream_or_reverse_host = self.context.upstream_or_reverse_address[
+                0
+            ].encode("idna")
             sans.add(upstream_or_reverse_host)
             if host is None:
                 host = upstream_or_reverse_host
@@ -522,16 +564,18 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
             sans.add(host)
 
         # build the certificate, possibly adding extra certs and store the OpenSSL cert
-        return self.proxy.generate_certificate(
+        return self.context.generate_certificate(
             host,
             list(sans),
             organization,
             extra_chain=self._default_outgoing_protocol.server_certs
-            if self.proxy.options.add_upstream_certs_to_client_chain
+            if self.context.options.add_upstream_certs_to_client_chain
             else None,
         )
 
-    def _create_flow_request(self, stream_id: int, headers: Headers) -> http.HTTPFlow:
+    def _create_request(
+        self, flow: http.HTTPFlow, headers: Headers
+    ) -> http.HTTPRequest:
         known_pseudo_headers: Dict[bytes, KnownPseudoHeaders] = {
             b":" + x.name.encode(): x for x in KnownPseudoHeaders
         }
@@ -551,12 +595,6 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
             if value is None:
                 raise ProtocolError(f"Pseudo header :{header.name} is missing.")
             return value
-
-        # create the flow
-        flow = http.HTTPFlow(
-            client_conn=self, server_conn=None, live=True, mode=self.proxy.mode.name
-        )
-        flow.metadata[META_STREAM_ID] = stream_id
 
         # filter out known headers (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.3)
         for header, value in headers:
@@ -642,7 +680,7 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
             )
 
         # get the host and port, depending on the mode of operation
-        if self.proxy.mode is ProxyMode.regular:
+        if self.context.mode is ProxyMode.regular:
             # check if a target was given
             if host_header is None:
                 raise FlowException(
@@ -692,17 +730,17 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
                     f"Regular proxy only supports 'http' and 'https' :scheme, got '{scheme.decode()}'.",
                 )
         elif (
-            self.proxy.mode is ProxyMode.upstream
-            or self.proxy.mode is ProxyMode.reverse
+            self.context.mode is ProxyMode.upstream
+            or self.context.mode is ProxyMode.reverse
         ):
-            host, port = self.proxy.upstream_or_reverse_address
-        elif self.proxy.mode is ProxyMode.transparent:
+            host, port = self.context.upstream_or_reverse_address
+        elif self.context.mode is ProxyMode.transparent:
             host, port = self.server
         else:
             raise NotImplementedError
 
         # create the request object and return the flow
-        flow.request = http.HTTPRequest(
+        return http.HTTPRequest(
             first_line_format,
             method,
             scheme,
@@ -715,14 +753,18 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
             timestamp_start=time.time(),
             timestamp_end=None,
         )
-        return flow
+
+    async def on_flow_http_event(self, flow: http.HTTPFlow, event: H3Event) -> None:
+        if isinstance(event, HeadersReceived):
+
+
 
     def _create_handler(self, event: HeadersReceived) -> IncomingHandler:
         # parse the headers and let mitmproxy change them
         flow = self._create_flow_request(event.stream_id, event.headers)
         print("O1")
         self.log(LogLevel.warn, "ok")
-        self.proxy.ask("requestheaders", flow)
+        self.context.ask("requestheaders", flow)
         print("O2")
 
         # basically copied from mitmproxy
@@ -742,9 +784,9 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         else:
             return IncomingHttpHandler(protocol=self, flow=flow)
 
-    def on_handshake_completed(self, event: HandshakeCompleted) -> None:
-        super().on_handshake_completed(event)
-        self.mitmcert = self.proxy.convert_certificate(event.certificates[0])
+    async def on_handshake_completed(self, event: HandshakeCompleted) -> None:
+        await super().on_handshake_completed(event)
+        self.mitmcert = self.context.convert_certificate(event.certificates[0])
 
 
 class SessionTicketStore:
