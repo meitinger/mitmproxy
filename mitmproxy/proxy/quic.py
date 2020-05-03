@@ -19,6 +19,7 @@ from mitmproxy import exceptions
 from mitmproxy import http
 from mitmproxy import log
 from mitmproxy import proxy
+from mitmproxy import tcp
 from mitmproxy import flow as baseflow
 from mitmproxy.net.http import url
 
@@ -27,6 +28,11 @@ import OpenSSL
 import certifi
 from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.hazmat.primitives.asymmetric import (
+    dsa,
+    ec,
+    rsa,
+)
 
 from ..net.tls import log_master_secret
 from ..version import VERSION
@@ -50,12 +56,13 @@ from aioquic.quic.events import (
     HandshakeCompleted,
     ProtocolNegotiated,
     QuicEvent,
+    StreamDataReceived,
     StreamReset,
 )
 from aioquic.quic.packet import QuicErrorCode
 from aioquic.tls import (
-    CertificateWithPrivateKey,
     ClientHello,
+    Context as TlsContext,
     SessionTicket,
     load_pem_private_key,
     load_pem_x509_certificates,
@@ -122,7 +129,11 @@ class ProxyContext:
         sans: Set[bytes],
         organization: Optional[bytes] = None,
         extra_chain: Optional[List[certs.Cert]] = None,
-    ) -> CertificateWithPrivateKey:
+    ) -> Tuple[
+        x509.Certificate,
+        List[x509.Certificate],
+        Union[dsa.DSAPrivateKey, ec.EllipticCurvePrivateKey, rsa.RSAPrivateKey],
+    ]:
         cert, private_key, chain_file = self._config.certstore.get_cert(
             commonname, list(sans), organization
         )
@@ -137,12 +148,12 @@ class ProxyContext:
                         )
                     )
                 )
-        return CertificateWithPrivateKey(
-            cert=load_pem_x509_certificates(
+        return (
+            load_pem_x509_certificates(
                 OpenSSL.crypto.dump_certificate(OpenSSL.crypto.FILETYPE_PEM, cert.x509)
             )[0],
-            chain=chain,
-            private_key=load_pem_private_key(
+            chain,
+            load_pem_private_key(
                 OpenSSL.crypto.dump_privatekey(
                     OpenSSL.crypto.FILETYPE_PEM, private_key
                 ),
@@ -171,7 +182,7 @@ class ProxyContext:
             )
 
 
-class FlowException(Exception):
+class FlowError(Exception):
     def __init__(self, flow: http.HTTPFlow, status: int, message: str):
         super().__init__(message)
         self.flow = flow
@@ -179,16 +190,24 @@ class FlowException(Exception):
         self.message = message
 
 
+# NOTE: The following classes are written in a way to allow additing additional
+#       protocols, or even raw stream data. So a flow is any flow, while methods
+#       like `send_http` or `on_flow_http_event` are protocol related.
+
+
 class ConnectionProtocol(QuicConnectionProtocol):
-    def __init__(self, conn_name: str, proxy: ProxyContext, *args, **kwargs):
+    def __init__(self, direction: str, proxy: ProxyContext, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._flows: Dict[int, http.HTTPFlow] = {}
+        self._flows: Dict[int, Tuple[baseflow.Flow, bool]] = {}
         self._http: Optional[HttpConnection] = None
-        self._flow_conn_name: str = conn_name
-        self._flow_meta_id: str = conn_name + "_stream_id"
+        self._stream_meta_name: str = direction + "-stream-id"
         self._events: asyncio.Queue[QuicEvent] = asyncio.Queue()
+        self._local_close: bool = False
+        self._is_closed: bool = False
         self.context: ProxyContext = proxy
-        
+        self.proto_out: OutgoingProtocol = None
+        self.proto_in: IncomingProtocol = None
+
         # schedule message pump
         asyncio.ensure_future(self._dispatcher(), self._loop)
 
@@ -201,60 +220,114 @@ class ConnectionProtocol(QuicConnectionProtocol):
         if address is not None:
             raise PermissionError
 
+    def connected(self):
+        return not self._is_closed
+
     async def _dispatcher(self) -> None:
-        event: H3Event = None
+        event: QuicEvent = None
         while not isinstance(event, ConnectionTerminated):
             event = await self._events.get()
             try:
                 try:
+                    # handle known events
                     if isinstance(event, HandshakeCompleted):
                         await self.on_handshake_completed(event)
                     elif isinstance(event, ConnectionTerminated):
                         await self.on_connection_terminated(
-                            event.error_code, event.reason_phrase
+                            event.error_code, event.reason_phrase, not self._local_close
                         )
                     elif isinstance(event, StreamReset):
-                        await self._handle_stream_reset(event)
-
-                    # forward to http connection if established
-                    if self._http is not None:
-                        for http_event in self._http.handle_event(event):
-                            await self._handle_http_event(http_event)
-                except FlowException as exc:
-                    await self._handle_flow_exception(exc)
+                        await self._handle_stream_ended(
+                            event.stream_id, event.error_code
+                        )
+                    elif isinstance(event, StreamDataReceived):
+                        if self._http is None:
+                            await self._handle_raw_data(event)
+                        else:
+                            # forward to http connection if established
+                            for http_event in self._http.handle_event(event):
+                                await self._handle_http_event(http_event)
+                        if event.end_stream:
+                            await self._handle_stream_ended(
+                                event.stream_id, QuicErrorCode.NO_ERROR
+                            )
+                except FlowError as exc:
+                    await self._handle_flow_error(exc)
                 except ProtocolError as exc:
-                    self._quic.close(
-                        error_code=exc.error_code, reason_phrase=exc.reason_phrase
-                    )
-                    self.transmit()
+                    await self._handle_protocol_error(exc)
                 except Exception as exc:
                     self.log(
                         LogLevel.error,
                         "Uncaught exception.",
-                        {"error": repr(exc), "stacktrace": traceback.format_stack()},
+                        {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                            "stacktrace": traceback.format_stack(),
+                        },
                     )
             except:
+                # when even logging fails
                 traceback.print_exc(file=sys.stderr)
 
-    async def _handle_flow_exception(self, exc: FlowException) -> None:
+    @property
+    def is_client(self) -> bool:
+        return self is self.proto_in
+
+    @property
+    def proto_other(self) -> ConnectionProtocol:
+        return cast(
+            ConnectionProtocol,
+            self.proto_out if self.is_client else self.proto_in,
+        )
+
+    async def _handle_raw_data(self, event: StreamDataReceived) -> None:
+        if event.stream_id not in self._flows:
+            # create and enlist the flow
+            flow = tcp.TCPFlow(self.proto_in, self.proto_out, True)
+            flow.metadata[self._stream_meta_name] = event.stream_id
+            self._flows[event.stream_id] = (flow, False)
+
+            # create a stream and enlist the flow on the other proto
+            other = self.proto_other
+            other_stream_id = other._quic.get_next_available_stream_id()
+            flow.metadata[other._stream_meta_name] = other_stream_id
+            other._flows[other_stream_id] = (flow, False)
+
+            # notify mitmproxy
+            await self.context.ask("tcp_start", flow)
+        else:
+            flow, has_ended = self._flows[event.stream_id]
+            if not isinstance(flow, tcp.TCPFlow):
+                raise FlowError(
+                    flow, 500, f"TCPFlow expected, got '{type(flow).__name__}'."
+                )
+
+        # enqueue the message
+        tcp_message = tcp.TCPMessage(self.is_client, event.data)
+        flow.messages.append(tcp_message)
+        await self.context.ask("tcp_message", flow)
+
+    async def _handle_flow_error(self, exc: FlowError) -> None:
         # ensure a stream id is set
         flow = exc.flow
-        stream_id = flow.metadata[self._flow_meta_id]
+        stream_id = flow.metadata.get(self._flow_meta_id)
         self.log(
-            LogLevel.warn, exc.message, {"live": flow.live, "stream_id": stream_id},
+            LogLevel.warn,
+            exc.message,
+            {"type": flow.type, "live": flow.live, "stream_id": stream_id},
         )
         assert stream_id is not None
 
-        # report the error
-        if not flow.live:
+        # report the error (and prevent re-entry)
+        if flow.error is not None:
             return
         flow.error = baseflow.Error(str(exc))
         await self.context.ask("error", flow)
+
+        # send the error and close the flow
         if not flow.live:
             return
-
-        # send and error and close the flow
-        if self._http is not None:
+        if isinstance(flow, http.HTTPFlow) and self._http is not None:
             try:
                 self._http.send_headers(
                     stream_id,
@@ -295,12 +368,28 @@ class ConnectionProtocol(QuicConnectionProtocol):
                     {"event": event.__name__, "stream_id": event.stream_id},
                 )
             flow = self._flows[event.stream_id]
+            if not isinstance(flow, http.HTTPFlow):
+                raise FlowError(
+                    flow, 500, f"HTTPFlow expected, got '{type(flow).__name__}'."
+                )
         try:
-            await self.on_flow_http_event(flow, event)
+            # FIN only events are handled by self.on_flow_ended
+            if (
+                not event.stream_ended
+                or not isinstance(event, DataReceived)
+                or len(event.data) > 0
+            ):
+                await self.on_flow_http_event(flow, event)
         finally:
             if event.stream_ended and flow.live:
                 flow.live = False
                 await self.on_flow_ended(flow, QuicErrorCode.NO_ERROR, True)
+
+    async def _handle_protocol_error(self, exc: ProtocolError) -> None:
+        # close the connection (will be logged when ConnectionTerminated is handled)
+        self._local_close = True
+        self._quic.close(error_code=exc.error_code, reason_phrase=exc.reason_phrase)
+        self.transmit()
 
     async def _handle_stream_reset(self, event: StreamReset) -> None:
         if event.stream_id not in self._flows:
@@ -314,8 +403,8 @@ class ConnectionProtocol(QuicConnectionProtocol):
             flow.live = False
             await self.on_flow_ended(flow, event.error_code, True)
 
-    async def flow_create_stream(
-        self, flow: http.HTTPFlow, is_unidirectional: bool = False
+    async def begin_flow(
+        self, flow: baseflow.Flow, is_unidirectional: bool = False
     ) -> int:
         assert getattr(flow, self._flow_conn_name) is None
         setattr(flow, self._flow_conn_name, self)
@@ -324,7 +413,11 @@ class ConnectionProtocol(QuicConnectionProtocol):
         self._flows[stream_id] = flow
         return stream_id
 
-    async def flow_send(
+    def close(self) -> None:
+        self._local_close = True
+        super().close()
+
+    async def send_http(
         self,
         flow: http.HTTPFlow,
         headers: Optional[Headers] = None,
@@ -332,9 +425,9 @@ class ConnectionProtocol(QuicConnectionProtocol):
         end_flow: bool = False,
     ) -> None:
         if not flow.live:
-            raise FlowException(flow, 500, "Flow is not live.")
+            raise FlowError(flow, 500, "Flow is not live.")
         if self._http is None:
-            raise FlowException(flow, 503, "No HTTP connection available.")
+            raise FlowError(flow, 503, "No HTTP connection available.")
         stream_id = flow.metadata.get(self._flow_meta_id)
         assert stream_id is not None
         try:
@@ -343,7 +436,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
             if body is not None or (headers is None and end_flow):
                 self._http.send_data(stream_id, b"" if body is None else body, end_flow)
         except FrameUnexpected as e:
-            raise FlowException(flow, 500, str(e))
+            raise FlowError(flow, 500, str(e))
         else:
             self.transmit()
         if end_flow:
@@ -364,13 +457,23 @@ class ConnectionProtocol(QuicConnectionProtocol):
         return msg
 
     async def on_connection_terminated(
-        self, error_code: int, reason_phrase: str
+        self, error_code: int, reason_phrase: str, by_peer: bool
     ) -> None:
+        self._is_closed = True
+        self.timestamp_end = time.time()
         self.log(
             LogLevel.info if error_code == QuicErrorCode.NO_ERROR else LogLevel.warn,
             "Connection closed.",
-            {"error_code": error_code, "reason_phrase": reason_phrase},
+            {
+                "error_code": error_code,
+                "reason_phrase": reason_phrase,
+                "by_peer": by_peer,
+            },
         )
+        for flow in self._flows.items():
+            if flow.live:
+                flow.live = False
+                await self.on_flow_ended(flow, error_code, by_peer)
 
     async def on_handshake_completed(self, event: HandshakeCompleted) -> None:
         # set the proper http connection
@@ -387,7 +490,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
         self.tls_version = "TLSv1.3"
 
     async def on_flow_ended(
-        self, flow: http.HTTPFlow, error_code: int, by_remote: bool
+        self, flow: baseflow.Flow, error_code: int, by_peer: bool
     ) -> None:
         pass
 
@@ -399,9 +502,11 @@ class ConnectionProtocol(QuicConnectionProtocol):
 
 
 class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
-    def __init__(self, *args, **kwargs) -> None:
-        ConnectionProtocol.__init__(self, "server_conn", *args, **kwargs)
+    def __init__(self, proto_in: IncomingProtocol, *args, **kwargs) -> None:
+        ConnectionProtocol.__init__(self, "out", proto_in.context, *args, **kwargs)
         connections.ServerConnection.__init__(self, None, None, None)
+        self.proto_out = self
+        self.proto_in = proto_in
 
     @property
     def source_address(self) -> Tuple[str, int]:
@@ -422,10 +527,10 @@ class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
 
 class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
     def __init__(self, *args, **kwargs) -> None:
-        ConnectionProtocol.__init__(self, "client_conn", *args, **kwargs)
+        ConnectionProtocol.__init__(self, "in", *args, **kwargs)
         connections.ClientConnection.__init__(self, None, None, None)
-        self._default_outgoing_protocol: OutgoingProtocol = None
-        self._quic._certificate_fetcher = self._fetch_certificate
+        self._quic.tls.client_hello_cb = self._handle_client_hello
+        self.proto_in = self
 
     @property
     def server(self) -> Tuple[str, int]:
@@ -447,133 +552,7 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
     def log_format(self, msg: str) -> str:
         return f"[QUIC-in] {self.address[0]}:{self.address[1]} -> {self.server[0]}:{self.server[1]}: {msg}"
 
-    async def _ensure_default_outgoing_protocol(self) -> None:
-        if self._default_outgoing_protocol is None:
-            connection = QuicConnection(
-                configuration=QuicConfiguration(
-                    alpn_protocols=H3_ALPN + H0_ALPN,
-                    is_client=True,
-                    server_name=None if self.sni is None else self.sni.decode("idna"),
-                    secrets_log_file=log_master_secret,
-                )
-            )
-            _, protocol = await loop.create_datagram_endpoint(
-                lambda: OutgoingProtocol(connection),
-                local_addr=(local_host, local_port),
-            )
-            protocol = cast(QuicConnectionProtocol, protocol)
-            protocol.connect(addr)
-            # self._default_outgoing_protocol =
-            await self._default_outgoing_protocol.wait_connect()
-
-    def _process_events_and_transmit(self, future: asyncio.Future) -> None:
-        future.result()
-        self._process_events()
-        self.transmit()
-
-    def datagram_received(
-        self, data: bytes, addr: Tuple, orig_dst: Optional[Tuple] = None
-    ) -> None:
-        if self.tls_established:
-            self._quic.receive_datagram(
-                cast(bytes, data), addr, self._loop.time(), orig_dst
-            )
-            self._process_events()
-            self.transmit()
-        else:
-            # everything before the handshake must happen in a different thread
-            # to support blocking for the client, since QuicConnection is not async
-            self._loop.run_in_executor(
-                None,
-                self._quic.receive_datagram,
-                bytes(data),
-                addr,
-                self._loop.time(),
-                orig_dst,
-            ).add_done_callback(self._process_events_and_transmit)
-
-    def _create_or_get_connection(
-        self, authority: Optional[Tuple[str, int]] = None
-    ) -> OutgoingProtocol:
-        if authority is None:
-            if self.context.mode is ProxyMode.regular:
-                raise ValueError(
-                    "Parameter authority must not be None for regular proxies."
-                )
-            elif (
-                self.context.mode is ProxyMode.upstream
-                or self.context.mode is ProxyMode.reverse
-            ):
-                authority = self.context.upstream_or_reverse_address
-            elif self.context.mode is ProxyMode.transparent:
-                authority = self.server
-            else:
-                raise NotImplementedError
-
-    def _fetch_certificate(
-        self, hello: ClientHello
-    ) -> Optional[CertificateWithPrivateKey]:
-        host: bytes = None
-        sans: Set = set()
-        organization: str = None
-
-        # store the sni
-        self.sni = (
-            None if hello.server_name is None else hello.server_name.encode("idna")
-        )
-
-        # create the outgoing connection if the destination is known and it's necessary
-        if self.context.mode is not ProxyMode.regular and (
-            self.context.options.upstream_cert
-            or self.context.options.add_upstream_certs_to_client_chain
-        ):
-            asyncio.run_coroutine_threadsafe(
-                self._ensure_default_outgoing_protocol(), self._loop
-            ).result()
-
-            # copy over all possible values
-            upstream_cert = self._default_outgoing_protocol.cert
-            sans.update(upstream_cert.altnames)
-            if upstream_cert.cn:
-                host = upstream_cert.cn.decode("utf8").encode("idna")
-                sans.add(host)
-            if upstream_cert.organization:
-                organization = upstream_cert.organization
-
-        # add the name of server name of the reverse target or upstream proxy
-        if (
-            self.context.mode is ProxyMode.upstream
-            or self.context.mode is ProxyMode.reverse
-        ):
-            upstream_or_reverse_host = self.context.upstream_or_reverse_address[
-                0
-            ].encode("idna")
-            sans.add(upstream_or_reverse_host)
-            if host is None:
-                host = upstream_or_reverse_host
-
-        # add the wanted server name (even if the client wants that name, do not override upstream_cert host)
-        if self.sni is not None:
-            sans.add(self.sni)
-            if host is None:
-                host = self.sni
-
-        # as a last resort, add the ip
-        if host is None:
-            host = self.server[0].encode("idna")
-            sans.add(host)
-
-        # build the certificate, possibly adding extra certs and store the OpenSSL cert
-        return self.context.generate_certificate(
-            host,
-            list(sans),
-            organization,
-            extra_chain=self._default_outgoing_protocol.server_certs
-            if self.context.options.add_upstream_certs_to_client_chain
-            else None,
-        )
-
-    def _create_request(
+    def _build_http_flow_request(
         self, flow: http.HTTPFlow, headers: Headers
     ) -> http.HTTPRequest:
         known_pseudo_headers: Dict[bytes, KnownPseudoHeaders] = {
@@ -683,7 +662,7 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         if self.context.mode is ProxyMode.regular:
             # check if a target was given
             if host_header is None:
-                raise FlowException(
+                raise FlowError(
                     flow,
                     400,
                     "Request to regular proxy requires :authority or host header.",
@@ -724,7 +703,7 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
             elif scheme.lower() == b"https":
                 port = 443
             else:
-                raise FlowException(
+                raise FlowError(
                     flow,
                     501,
                     f"Regular proxy only supports 'http' and 'https' :scheme, got '{scheme.decode()}'.",
@@ -754,35 +733,182 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
             timestamp_end=None,
         )
 
+    async def _create_outgoing_protocol(
+        self, *, remote_addr=Tuple[str, int], sni: Optional[str], alpn_protocols: List[str]
+    ) -> OutgoingProtocol:
+        connection = QuicConnection(
+            configuration=QuicConfiguration(
+                alpn_protocols=alpn_protocols,
+                is_client=True,
+                server_name=sni,
+                secrets_log_file=log_master_secret,
+            )
+        )
+        if self.context.options.spoof_source_address:
+            self.log(LogLevel.info, "Source address spoofing not yet supported.")
+        _, protocol = await self._loop.create_datagram_endpoint(
+            functools.partial(OutgoingProtocol, self, connection),
+            local_addr=(self.context.options.listen_host or "::", 0),
+        )
+        protocol = cast(QuicConnectionProtocol, protocol)
+        protocol.connect(remote_addr)
+        await protocol.wait_connect()
+        return protocol
+
+    def _handle_client_hello(self, hello: ClientHello) -> None:
+        tls: TlsContext = self._quic.tls
+        host: bytes = None
+        sans: Set = set()
+        organization: Optional[str] = None
+        extra_chain: Optional[List[certs.Cert]] = None
+
+        # store the sni
+        self.sni = (
+            None if hello.server_name is None else hello.server_name.encode("idna")
+        )
+
+        # create the outgoing connection if possible
+        # NOTE: This is a derivation to mitmproxy's default behavior. Mitmproxy only initiates a connection
+        #       if it is necessary, e.g. if `upstream_cert` is set. Otherwise it allows to replay an entire
+        #       flow. However, in order to allow the inspection of any stream data, this would require
+        #       something like `ask("alpn_protocol", flow)` to also record and replay the selected protocol.
+        if self.context.mode is not ProxyMode.regular:
+            self.proto_out = asyncio.run_coroutine_threadsafe(
+                self._create_outgoing_protocol(
+                    remote_addr=self.server
+                    if self.context.mode is ProxyMode.transparent
+                    else self.context.upstream_or_reverse_address,
+                    sni=hello.server_name,
+                    alpn_protocols=hello.alpn_protocols,
+                ),
+                self._loop,
+            ).result()
+            tls.alpn_negotiated = self.proto_out.alpn_proto_negotiated
+
+            # copy over all possible certificate data if requested
+            if self.context.options.upstream_cert:
+                upstream_cert = self.proto_out.cert
+                sans.update(upstream_cert.altnames)
+                if upstream_cert.cn:
+                    host = upstream_cert.cn.decode("utf8").encode("idna")
+                    sans.add(host)
+                if upstream_cert.organization:
+                    organization = upstream_cert.organization
+            if self.context.options.add_upstream_certs_to_client_chain:
+                extra_chain = self.proto_out.server_certs
+
+        # add the name of server name of the reverse target or upstream proxy
+        if (
+            self.context.mode is ProxyMode.upstream
+            or self.context.mode is ProxyMode.reverse
+        ):
+            upstream_or_reverse_host = self.context.upstream_or_reverse_address[
+                0
+            ].encode("idna")
+            sans.add(upstream_or_reverse_host)
+            if host is None:
+                host = upstream_or_reverse_host
+
+        # add the wanted server name (even if the client wants that name, do not override upstream_cert host)
+        if self.sni is not None:
+            sans.add(self.sni)
+            if host is None:
+                host = self.sni
+
+        # as a last resort, add the ip
+        if host is None:
+            host = self.server[0].encode("idna")
+            sans.add(host)
+
+        # build the certificate, possibly adding extra certs and store the OpenSSL cert
+        (
+            tls.certificate,
+            tls.certificate_chain,
+            tls.certificate_private_key,
+        ) = self.context.generate_certificate(
+            host, list(sans), organization, extra_chain=extra_chain,
+        )
+
+    def _process_events_and_transmit(self, future: asyncio.Future) -> None:
+        future.result()
+        self._process_events()
+        self.transmit()
+
+    def datagram_received(
+        self, data: bytes, addr: Tuple, orig_dst: Optional[Tuple] = None
+    ) -> None:
+        if self.tls_established:
+            self._quic.receive_datagram(
+                cast(bytes, data), addr, self._loop.time(), orig_dst
+            )
+            self._process_events()
+            self.transmit()
+        else:
+            # everything before the handshake must happen in a different thread
+            # to support blocking for the client, since QuicConnection is not async
+            self._loop.run_in_executor(
+                None,
+                self._quic.receive_datagram,
+                bytes(data),
+                addr,
+                self._loop.time(),
+                orig_dst,
+            ).add_done_callback(self._process_events_and_transmit)
+
     async def on_flow_http_event(self, flow: http.HTTPFlow, event: H3Event) -> None:
         if isinstance(event, HeadersReceived):
+            if flow.request is None:
+                await self._handle_http_request(flow, event)
+            else:
+                await self._handle_http_trailers(flow, event)
+        elif isinstance(event, DataReceived):
+            await self._handle_http_data(flow, event)
 
-
-
-    def _create_handler(self, event: HeadersReceived) -> IncomingHandler:
-        # parse the headers and let mitmproxy change them
-        flow = self._create_flow_request(event.stream_id, event.headers)
-        print("O1")
-        self.log(LogLevel.warn, "ok")
-        self.context.ask("requestheaders", flow)
-        print("O2")
+    async def _handle_http_request(
+        self, flow: http.HTTPFlow, event: HeadersReceived
+    ) -> None:
+        # parse the headers and allow patching
+        flow.request = self._create_request(flow, event.headers)
+        await self.context.ask("requestheaders", flow)
 
         # basically copied from mitmproxy
         if flow.request.headers.get("expect", "").lower() == "100-continue":
-            self.flow_send(flow, headers=[(b":status", b"100")])
+            self.send_http(flow, headers=[(b":status", b"100")])
             flow.request.headers.pop("expect")
 
         # check for connect
         if flow.request.method == "CONNECT":
-            raise FlowException(
+            raise FlowError(
                 flow,
                 501,
                 "Websockets not yet implemented."
                 if flow.metadata[META_WEBSOCKET]
                 else "CONNECT for QUIC not implemented.",
             )
+
+        # handle different content scenarios
+        if flow.request.stream:
+            flow.request.data.content = None
         else:
-            return IncomingHttpHandler(protocol=self, flow=flow)
+            flow.request.data.content = b""
+            if event.stream_ended:
+                return
+        await self._http_request_has_data_continue(flow, event)
+
+    async def _handle_http_trailers(self, flow: http.HTTPFlow, event: HeadersReceived):
+        pass
+
+    async def _handle_http_data(self, flow: http.HTTPFlow, event: DataReceived):
+        if flow.request.stream:
+            return
+        flow.request.data.content += event.data
+        if event.stream_ended:
+            await self._http_request_continue(flow, event)
+
+    async def _http_request_has_data_continue(
+        self, flow: http.HTTPFlow, event: H3Event
+    ):
+        flow.request.timestamp_end = time.time()
 
     async def on_handshake_completed(self, event: HandshakeCompleted) -> None:
         await super().on_handshake_completed(event)
@@ -805,7 +931,7 @@ def quicServer(config: proxy.ProxyConfig, channel: controller.Channel):
     ticket_store = SessionTicketStore()
     context = ProxyContext(config, channel)
     hostname = socket.gethostname().encode("idna")
-    certificate = context.generate_certificate(
+    certificate, certificate_chain, private_key = context.generate_certificate(
         hostname, {b"localhost", b"::1", b"127.0.0.1", hostname}, b"mitmproxy/quic"
     )
 
@@ -814,13 +940,15 @@ def quicServer(config: proxy.ProxyConfig, channel: controller.Channel):
         context.options.listen_host or "::",
         context.options.listen_port,
         configuration=QuicConfiguration(
-            alpn_protocols=H3_ALPN + H0_ALPN,
+            alpn_protocols=H3_ALPN + H0_ALPN
+            if context.mode is ProxyMode.regular
+            else None,
             is_client=False,
             is_transparent=context.mode is ProxyMode.transparent,
             secrets_log_file=log_master_secret,
-            certificate=certificate.cert,
-            certificate_chain=certificate.chain,
-            private_key=certificate.private_key,
+            certificate=certificate,
+            certificate_chain=certificate_chain,
+            private_key=private_key,
         ),
         create_protocol=functools.partial(IncomingProtocol, context),
         session_ticket_fetcher=ticket_store.pop,
