@@ -191,7 +191,7 @@ class FlowError(Exception):
 class ConnectionProtocol(QuicConnectionProtocol):
     def __init__(self, proxy: ProxyContext, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._flows: Dict[int, Tuple[baseflow.Flow, bool]] = {}
+        self._flows: Dict[int, Tuple[baseflow.Flow, asyncio.Event]] = {}
         self._http: Optional[HttpConnection] = None
         self._events: asyncio.Queue[QuicEvent] = asyncio.Queue()
         self._local_close: bool = False
@@ -255,7 +255,10 @@ class ConnectionProtocol(QuicConnectionProtocol):
         else:
             flow.server_conn = self
             flow.metadata[META_SERVER_STREAM] = stream_id
-        self._flows[stream_id] = (flow, end_stream)
+        event = asyncio.Event(loop=self._loop)
+        if end_stream:
+            event.set()
+        self._flows[stream_id] = (flow, event)
 
     async def _dispatcher(self) -> None:
         event: QuicEvent = None
@@ -265,7 +268,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 try:
                     # handle known events
                     if isinstance(event, HandshakeCompleted):
-                        await self.on_handshake_completed(event)
+                        await self.on_handshake(event)
                     elif isinstance(event, ConnectionTerminated):
                         await self._handle_connection_terminated(event)
                     elif isinstance(event, StreamReset):
@@ -309,12 +312,6 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 # when even logging fails
                 traceback.print_exc(file=sys.stderr)
 
-    async def _end_flow(self, flow: baseflow.Flow) -> None:
-        if flow.live:
-            flow.live = False
-            if isinstance(flow, tcp.TCPFlow):
-                self.context.tell("tcp_end", flow)
-
     def _ensure_connected(self, flow: baseflow.Flow) -> None:
         if self._is_closed:
             raise FlowError(flow, 503, f"Connection {self} already closed.")
@@ -325,27 +322,24 @@ class ConnectionProtocol(QuicConnectionProtocol):
         if flow.error is not None:
             raise FlowError(flow, 500, "Flow already failed.")
 
-    def _ensure_flow_type(self, flow: baseflow.Flow, classinfo: Type) -> None:
-        if not isinstance(flow, classinfo):
-            raise FlowError(
-                flow,
-                500,
-                f"{classinfo.__name__} expected, got '{type(flow).__name__}'.",
-            )
-
     def _ensure_stream_not_ended_and_get_flow(
         self, stream_id: int, end_stream: bool, classinfo: Type
     ) -> baseflow.Flow:
-        flow, ended = self._flows[stream_id]
-        if ended or self._is_closed:
+        flow, event = self._flows[stream_id]
+        if event.is_set():
             raise FlowError(
                 flow,
                 409,
                 f"{'Client' if self.is_client else 'Server'} stream already ended.",
             )
         if end_stream:
-            self._flows[stream_id] = (flow, True)
-        self._ensure_flow_type(flow, classinfo)
+            event.set()
+        if not isinstance(flow, classinfo):
+            raise FlowError(
+                flow,
+                500,
+                f"{classinfo.__name__} expected.",
+            )
         return flow
 
     def _get_stream_id_from_flow(self, flow: baseflow.Flow) -> int:
@@ -403,14 +397,19 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 "by_peer": not self._local_close,
             },
         )
-        for flow, ended in self._flows.items():
-            if not ended:
-                if self._http is None:
-                    self._ensure_flow_type(flow, tcp.TCPFlow)
-                    await self._handle_raw_stream_end(flow)
-                else:
-                    self._ensure_flow_type(flow, http.HTTPFlow)
-                    await self._handle_http_stream_end(flow)
+
+        for _, (flow, event) in self._flows:
+            if not event.is_set():
+                event.set()
+                try:
+                    if isinstance(flow, tcp.TCPFlow):
+                        await self._handle_raw_stream_end(flow)
+                    elif isinstance(flow, http.HTTPFlow):
+                        await self._handle_http_stream_end(flow)
+                    else:
+                        raise FlowError(flow, 500, "Unknown flow type.")
+                except FlowError as exc:
+                    await self._handle_flow_error(exc)
 
     async def _handle_flow_error(self, exc: FlowError) -> None:
         # always log the error
@@ -428,27 +427,31 @@ class ConnectionProtocol(QuicConnectionProtocol):
         # close the flow and send an error if it's a http flow
         if not flow.live:
             return
-        await self._end_flow(flow)
+        await self._shutdown_flow(flow)
         if (
             isinstance(flow, http.HTTPFlow)
-            and isinstance(flow.client_conn, ConnectionProtocol)
+            and isinstance(flow.client_conn, IncomingProtocol)
             and not flow.client_conn._is_closed
             and flow.client_conn._http is not None
         ):
-            try:
-                flow.client_conn._http.send_headers(
-                    flow.client_conn._get_stream_id_from_flow(flow),
-                    [
-                        (b":status", exc.status),
-                        (b"server", SERVER_NAME.encode()),
-                        (b"date", formatdate(time.time(), usegmt=True).encode()),
-                    ],
-                    end_stream=True,
-                )
-            except FrameUnexpected:
-                pass
-            else:
-                flow.client_conn.transmit()
+            # test if the flow is properly associated
+            stream_id = flow.metadata.get(META_CLIENT_STREAM)
+            if stream_id is not None and flow.client_conn._flows.get(stream_id)[1] is flow:
+                try:
+                    # try to send the status
+                    flow.client_conn._http.send_headers(
+                        stream_id,
+                        [
+                            (b":status", exc.status),
+                            (b"server", SERVER_NAME.encode()),
+                            (b"date", formatdate(time.time(), usegmt=True).encode()),
+                        ],
+                        end_stream=True,
+                    )
+                except FrameUnexpected:
+                    pass
+                else:
+                    flow.client_conn.transmit()
 
     async def _handle_http_event(
         self, stream_id: int, event: H3Event, end_stream: bool
@@ -466,14 +469,14 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 return self.log(
                     LogLevel.debug,
                     "Unknown H3 event received.",
-                    {"event": event.__name__},
+                    {"event": type(event).__name__},
                 )
             if stream_id not in self._flows:
                 return self.log(
                     LogLevel.debug,
                     "H3 event received before any headers.",
                     {
-                        "event": event.__name__,
+                        "event": type(event).__name__,
                         "stream_id": stream_id,
                         "end_stream": end_stream,
                     },
@@ -484,13 +487,12 @@ class ConnectionProtocol(QuicConnectionProtocol):
 
         # handle event and stream end
         if not isinstance(event, DataReceived) or len(event.data) > 0 or not end_stream:
-            await self.on_http_event(flow, event)
+            await self.on_http(flow, event)
         if end_stream:
             await self._handle_http_stream_end(flow)
 
     async def _handle_http_stream_end(self, flow: http.HTTPFlow) -> None:
-        # end the flow if either no peer is connected or the peer ended as well
-        await self.on_http_completed(flow)
+        # shutdown the flow if either no peer is connected or the peer ended as well
         flow_proto_peer = cast(
             ConnectionProtocol, flow.server_conn if self.is_client else flow.client_conn
         )
@@ -501,7 +503,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 flow_proto_peer._get_stream_id_from_flow(flow)
             )
         ):
-            await self._end_flow(flow)
+            await self._shutdown_flow(flow)
 
     async def _handle_protocol_error(self, exc: ProtocolError) -> None:
         # close the connection (will be logged when ConnectionTerminated is handled)
@@ -520,7 +522,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 {
                     "stream_id": stream_id,
                     "end_stream": end_stream,
-                    "data": "" if data is None else data.decode(),
+                    "has_data": data is not None,
                 },
             )
             return
@@ -553,7 +555,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
             await self._handle_raw_stream_end(flow)
 
     async def _handle_raw_stream_end(self, flow: tcp.TCPFlow) -> None:
-        # end the flow if both streams ended
+        # shutdown the flow if both streams ended
         if (
             self.proto_peer is None
             or self.proto_peer._is_closed
@@ -561,16 +563,22 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 self.proto_peer._get_stream_id_from_flow(flow)
             )
         ):
-            await self._end_flow(flow)
+            await self._shutdown_flow(flow)
 
     def _has_stream_ended(self, stream_id: int) -> bool:
-        return self._flows[stream_id][1]
+        return self._flows[stream_id][1].is_set()
+
+    async def _shutdown_flow(self, flow: baseflow.Flow) -> None:
+        if flow.live:
+            flow.live = False
+            if isinstance(flow, tcp.TCPFlow):
+                self.context.tell("tcp_end", flow)
 
     def close(self) -> None:
         self._local_close = True
         super().close()
 
-    def connected(self):
+    def connected(self) -> bool:
         return not self._is_closed
 
     def log(
@@ -586,7 +594,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
         # should be overridden in subclass
         return msg
 
-    async def on_handshake_completed(self, event: HandshakeCompleted) -> None:
+    async def on_handshake(self, event: HandshakeCompleted) -> None:
         # set the proper http connection
         if event.alpn_protocol.startswith("h3-"):
             self._http = H3Connection(self._quic)
@@ -600,10 +608,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
         self.tls_established = True
         self.tls_version = "TLSv1.3"
 
-    async def on_http_completed(self, flow: http.HTTPFlow) -> None:
-        pass
-
-    async def on_http_event(self, flow: http.HTTPFlow, event: H3Event) -> None:
+    async def on_http(self, flow: http.HTTPFlow, event: H3Event) -> None:
         pass
 
     def quic_event_received(self, event: QuicEvent) -> None:
@@ -616,8 +621,6 @@ class ConnectionProtocol(QuicConnectionProtocol):
         body: Optional[bytes] = None,
         end_flow: bool = False,
     ) -> None:
-        if self._http is None:
-            raise FlowError(flow, 503, "No HTTP connection available.")
         self._ensure_flow_ready(flow)
         stream_id = self._get_stream_id_from_flow(flow)
         try:
@@ -629,6 +632,10 @@ class ConnectionProtocol(QuicConnectionProtocol):
             raise FlowError(flow, 500, str(e))
         else:
             self.transmit()
+
+    async def wait_http(self, flow: http.HTTPFlow)->None:
+        self._ensure_flow_ready(flow)
+        await self._flows[self._get_stream_id_from_flow(flow)][1].wait()
 
 
 class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
@@ -650,8 +657,13 @@ class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
     def log_format(self, msg: str) -> str:
         return f"[QUIC-out] {self.source_address[0]}:{self.source_address[1]} -> {self.address[0]}:{self.address[1]}: {msg}"
 
-    async def on_handshake_completed(self, event: HandshakeCompleted) -> None:
-        await super().on_handshake_completed(event)
+    async def begin_http_request(self, flow:http.HTTPFlow) -> None:
+        self._ensure_flow_ready(flow)
+        self._assign_flow_to_stream_id(flow, None, False)
+
+
+    async def on_handshake(self, event: HandshakeCompleted) -> None:
+        await super().on_handshake(event)
         self.cert = self.context.convert_certificate(event.certificates[0])
         self.server_certs = [
             self.context.convert_certificate(cert) for cert in event.certificates[1:]
@@ -685,7 +697,7 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
     def log_format(self, msg: str) -> str:
         return f"[QUIC-in] {self.address[0]}:{self.address[1]} -> {self.server[0]}:{self.server[1]}: {msg}"
 
-    async def _begin_http_request(
+    async def _handle_http_request(
         self, flow: http.HTTPFlow, event: HeadersReceived
     ) -> None:
         # parse the headers and allow patching
@@ -710,7 +722,6 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         # handle different content scenarios
         if flow.request.stream:
             flow.request.data.content = None
-            await self._end_http_request(flow)
         else:
             flow.request.data.content = b""
 
@@ -924,7 +935,7 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         await protocol.wait_connect()
         return protocol
 
-    async def _end_http_request(self, flow: http.HTTPFlow) -> None:
+    async def end_http_request(self, flow: http.HTTPFlow) -> None:
         flow.request.timestamp_end = time.time()
         self.log("request", "debug", [repr(flow.request)])
 
@@ -936,6 +947,20 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
             flow.request.host_header = self.context.upstream_or_reverse_address
 
         await self.context.ask("request", flow)
+
+        if not flow.response:
+            server = await self._create_outgoing_protocol() if self.context.mode is ProxyMode.regular else self.proto_out
+            server.begin_http_request(flow)
+        else:
+            await self.context.ask("responseheaders", flow)
+            await self.begin_http_response(flow)
+        
+        self.log("response", "debug", [repr(flow.response)])
+        await self.context.ask("response", flow)
+
+        if not flow.response.stream:
+            self.send_http(flow, flow.response.headers, flow.response.data.content, end_flow=True)
+
 
     def _handle_client_hello(self, hello: ClientHello) -> None:
         tls: TlsContext = self._quic.tls
@@ -1048,18 +1073,18 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
                 orig_dst,
             ).add_done_callback(self._process_events_and_transmit)
 
-    async def on_handshake_completed(self, event: HandshakeCompleted) -> None:
-        await super().on_handshake_completed(event)
+    async def on_handshake(self, event: HandshakeCompleted) -> None:
+        await super().on_handshake(event)
         self.mitmcert = self.context.convert_certificate(event.certificates[0])
 
     async def on_http_completed(self, flow: http.HTTPFlow) -> None:
         if not flow.request.stream:
-            await self._end_http_request(flow)
+            await self.end_http_request(flow)
 
-    async def on_http_event(self, flow: http.HTTPFlow, event: H3Event) -> None:
+    async def on_http(self, flow: http.HTTPFlow, event: H3Event) -> None:
         if isinstance(event, HeadersReceived):
             if flow.request is None:
-                await self._begin_http_request(flow, event)
+                await self.begin_http_request(flow, event)
             else:
                 if not flow.request.stream:
                     self._update_http_flow_request_headers(flow.request, event.headers)
