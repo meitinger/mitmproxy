@@ -1,39 +1,36 @@
 import asyncio
 import enum
 import functools
-import queue
 import socket
 import sys
 import time
-import threading
 import traceback
-from dataclasses import dataclass
 from email.utils import formatdate
 from typing import cast, Dict, List, Tuple, Optional, Set, Type, Union
 
 import mitmproxy
 from mitmproxy import certs
-from mitmproxy import controller
 from mitmproxy import connections
+from mitmproxy import controller
 from mitmproxy import exceptions
+from mitmproxy import flow as baseflow
 from mitmproxy import http
 from mitmproxy import log
 from mitmproxy import options as moptions
 from mitmproxy import proxy
 from mitmproxy import tcp
-from mitmproxy import flow as baseflow
 from mitmproxy.net.http import url
 
 import OpenSSL
 
 import certifi
 from cryptography import x509
-from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.hazmat.primitives.asymmetric import (
     dsa,
     ec,
     rsa,
 )
+from cryptography.hazmat.primitives.serialization import Encoding
 
 from ..net.tls import log_master_secret
 from ..version import VERSION
@@ -55,7 +52,6 @@ from aioquic.quic.connection import QuicConnection
 from aioquic.quic.events import (
     ConnectionTerminated,
     HandshakeCompleted,
-    ProtocolNegotiated,
     QuicEvent,
     StreamDataReceived,
     StreamReset,
@@ -216,18 +212,13 @@ class ConnectionProtocol(QuicConnectionProtocol):
         if address is not None:
             raise PermissionError
 
-    def connected(self):
-        return not self._is_closed
-
     @property
     def is_client(self) -> bool:
         return self is self.proto_in
 
     @property
     def proto_peer(self) -> ConnectionProtocol:
-        return cast(
-            ConnectionProtocol, self.proto_out if self.is_client else self.proto_in,
-        )
+        return self.proto_out if self.is_client else self.proto_in
 
     def _assign_flow_to_stream_id(
         self, flow: baseflow.Flow, stream_id: Optional[int], end_stream: bool
@@ -510,7 +501,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 flow_proto_peer._get_stream_id_from_flow(flow)
             )
         ):
-            self._end_flow(flow)
+            await self._end_flow(flow)
 
     async def _handle_protocol_error(self, exc: ProtocolError) -> None:
         # close the connection (will be logged when ConnectionTerminated is handled)
@@ -579,26 +570,8 @@ class ConnectionProtocol(QuicConnectionProtocol):
         self._local_close = True
         super().close()
 
-    async def send_http(
-        self,
-        flow: http.HTTPFlow,
-        headers: Optional[Headers] = None,
-        body: Optional[bytes] = None,
-        end_flow: bool = False,
-    ) -> None:
-        if self._http is None:
-            raise FlowError(flow, 503, "No HTTP connection available.")
-        self._ensure_flow_ready(flow)
-        stream_id = self._get_stream_id_from_flow(flow)
-        try:
-            if headers is not None:
-                self._http.send_headers(stream_id, headers, body is None and end_flow)
-            if body is not None or (headers is None and end_flow):
-                self._http.send_data(stream_id, b"" if body is None else body, end_flow)
-        except FrameUnexpected as e:
-            raise FlowError(flow, 500, str(e))
-        else:
-            self.transmit()
+    def connected(self):
+        return not self._is_closed
 
     def log(
         self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
@@ -627,14 +600,35 @@ class ConnectionProtocol(QuicConnectionProtocol):
         self.tls_established = True
         self.tls_version = "TLSv1.3"
 
-    async def on_http_event(self, flow: http.HTTPFlow, event: H3Event) -> None:
+    async def on_http_completed(self, flow: http.HTTPFlow) -> None:
         pass
 
-    async def on_http_completed(self, flow: http.HTTPFlow) -> None:
+    async def on_http_event(self, flow: http.HTTPFlow, event: H3Event) -> None:
         pass
 
     def quic_event_received(self, event: QuicEvent) -> None:
         self._events.put_nowait(event)
+
+    def send_http(
+        self,
+        flow: http.HTTPFlow,
+        headers: Optional[Headers] = None,
+        body: Optional[bytes] = None,
+        end_flow: bool = False,
+    ) -> None:
+        if self._http is None:
+            raise FlowError(flow, 503, "No HTTP connection available.")
+        self._ensure_flow_ready(flow)
+        stream_id = self._get_stream_id_from_flow(flow)
+        try:
+            if headers is not None:
+                self._http.send_headers(stream_id, headers, body is None and end_flow)
+            if body is not None or (headers is None and end_flow):
+                self._http.send_data(stream_id, b"" if body is None else body, end_flow)
+        except FrameUnexpected as e:
+            raise FlowError(flow, 500, str(e))
+        else:
+            self.transmit()
 
 
 class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
@@ -691,6 +685,35 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
     def log_format(self, msg: str) -> str:
         return f"[QUIC-in] {self.address[0]}:{self.address[1]} -> {self.server[0]}:{self.server[1]}: {msg}"
 
+    async def _begin_http_request(
+        self, flow: http.HTTPFlow, event: HeadersReceived
+    ) -> None:
+        # parse the headers and allow patching
+        flow.request = self._build_http_flow_request(flow, event.headers)
+        await self.context.ask("requestheaders", flow)
+
+        # basically copied from mitmproxy
+        if flow.request.headers.get("expect", "").lower() == "100-continue":
+            self.send_http(flow, headers=[(b":status", b"100")])
+            flow.request.headers.pop("expect")
+
+        # check for connect
+        if flow.request.method == "CONNECT":
+            raise FlowError(
+                flow,
+                501,
+                "Websockets not yet implemented."
+                if flow.metadata[META_WEBSOCKET]
+                else "CONNECT for QUIC not implemented.",
+            )
+
+        # handle different content scenarios
+        if flow.request.stream:
+            flow.request.data.content = None
+            await self._end_http_request(flow)
+        else:
+            flow.request.data.content = b""
+
     def _build_http_flow_request(
         self, flow: http.HTTPFlow, headers: Headers
     ) -> http.HTTPRequest:
@@ -716,13 +739,7 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
 
         # filter out known headers (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.3)
         for header, value in headers:
-            if header is None:
-                raise ProtocolError("Empty header name is not allowed.")
-            if header != header.lower():
-                raise ProtocolError(
-                    f"Uppercase header name '{header.decode()}' is not allowed."
-                )
-            if header.startswith(b":"):
+            if self._check_header_and_is_pseudo(header):
                 pseudo_header = known_pseudo_headers.get(header)
                 if pseudo_header is None:
                     raise ProtocolError(
@@ -872,6 +889,15 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
             timestamp_end=None,
         )
 
+    def _check_header_and_is_pseudo(self, header: Optional[bytes]) -> bool:
+        if header is None:
+            raise ProtocolError("Empty header name is not allowed.")
+        if header != header.lower():
+            raise ProtocolError(
+                f"Uppercase header name '{header.decode()}' is not allowed."
+            )
+        return header.startswith(b":")
+
     async def _create_outgoing_protocol(
         self,
         *,
@@ -897,6 +923,19 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         protocol.connect(remote_addr)
         await protocol.wait_connect()
         return protocol
+
+    async def _end_http_request(self, flow: http.HTTPFlow) -> None:
+        flow.request.timestamp_end = time.time()
+        self.log("request", "debug", [repr(flow.request)])
+
+        # update host header in reverse proxy mode
+        if (
+            self.context.mode is ProxyMode.reverse
+            and not self.context.options.keep_host_header
+        ):
+            flow.request.host_header = self.context.upstream_or_reverse_address
+
+        await self.context.ask("request", flow)
 
     def _handle_client_hello(self, hello: ClientHello) -> None:
         tls: TlsContext = self._quic.tls
@@ -977,6 +1016,17 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         self._process_events()
         self.transmit()
 
+    def _update_http_flow_request_headers(
+        self, request: http.HTTPRequest, headers: Headers
+    ) -> None:
+        # only allow non-pseudo headers (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.1.1)
+        for header, value in headers:
+            if self._check_header_and_is_pseudo(header):
+                raise ProtocolError(
+                    f"Pseudo header '{header.decode()}' not allowed in trailers."
+                )
+            request.headers.add(header, value)
+
     def datagram_received(
         self, data: bytes, addr: Tuple, orig_dst: Optional[Tuple] = None
     ) -> None:
@@ -998,64 +1048,24 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
                 orig_dst,
             ).add_done_callback(self._process_events_and_transmit)
 
-    async def on_flow_http_event(self, flow: http.HTTPFlow, event: H3Event) -> None:
-        if isinstance(event, HeadersReceived):
-            if flow.request is None:
-                await self._handle_http_request(flow, event)
-            else:
-                await self._handle_http_trailers(flow, event)
-        elif isinstance(event, DataReceived):
-            await self._handle_http_data(flow, event)
-
-    async def _handle_http_request(
-        self, flow: http.HTTPFlow, event: HeadersReceived
-    ) -> None:
-        # parse the headers and allow patching
-        flow.request = self._create_request(flow, event.headers)
-        await self.context.ask("requestheaders", flow)
-
-        # basically copied from mitmproxy
-        if flow.request.headers.get("expect", "").lower() == "100-continue":
-            self.send_http(flow, headers=[(b":status", b"100")])
-            flow.request.headers.pop("expect")
-
-        # check for connect
-        if flow.request.method == "CONNECT":
-            raise FlowError(
-                flow,
-                501,
-                "Websockets not yet implemented."
-                if flow.metadata[META_WEBSOCKET]
-                else "CONNECT for QUIC not implemented.",
-            )
-
-        # handle different content scenarios
-        if flow.request.stream:
-            flow.request.data.content = None
-        else:
-            flow.request.data.content = b""
-            if event.stream_ended:
-                return
-        await self._http_request_has_data_continue(flow, event)
-
-    async def _handle_http_trailers(self, flow: http.HTTPFlow, event: HeadersReceived):
-        pass
-
-    async def _handle_http_data(self, flow: http.HTTPFlow, event: DataReceived):
-        if flow.request.stream:
-            return
-        flow.request.data.content += event.data
-        if event.stream_ended:
-            await self._http_request_continue(flow, event)
-
-    async def _http_request_has_data_continue(
-        self, flow: http.HTTPFlow, event: H3Event
-    ):
-        flow.request.timestamp_end = time.time()
-
     async def on_handshake_completed(self, event: HandshakeCompleted) -> None:
         await super().on_handshake_completed(event)
         self.mitmcert = self.context.convert_certificate(event.certificates[0])
+
+    async def on_http_completed(self, flow: http.HTTPFlow) -> None:
+        if not flow.request.stream:
+            await self._end_http_request(flow)
+
+    async def on_http_event(self, flow: http.HTTPFlow, event: H3Event) -> None:
+        if isinstance(event, HeadersReceived):
+            if flow.request is None:
+                await self._begin_http_request(flow, event)
+            else:
+                if not flow.request.stream:
+                    self._update_http_flow_request_headers(flow.request, event.headers)
+        elif isinstance(event, DataReceived):
+            if not flow.request.stream:
+                flow.request.data.content += event.data
 
 
 class SessionTicketStore:
