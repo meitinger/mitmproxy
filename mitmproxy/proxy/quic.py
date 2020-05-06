@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import collections
 import enum
 import functools
 import socket
@@ -7,7 +8,7 @@ import sys
 import time
 import traceback
 from email.utils import formatdate
-from typing import cast, Coroutine, Dict, List, Tuple, Optional, Set, Type, Union
+from typing import cast, Callable, Coroutine, Deque, Dict, List, Tuple, Optional, Set, Type, Union
 
 import mitmproxy
 from mitmproxy import certs
@@ -71,9 +72,6 @@ from aioquic.tls import (
 
 HttpConnection = Union[H0Connection, H3Connection]
 
-META_WEBSOCKET = "websocket"
-META_CLIENT_STREAM = "in-stream-id"
-META_SERVER_STREAM = "out-stream-id"
 SERVER_NAME = "mitmproxy/" + VERSION
 
 
@@ -137,6 +135,18 @@ class ProxyContext:
                 f"Only upstream and reverse proxies take urls, not {self.mode.name} proxies."
             )
 
+    async def ask(self, mtype, m):
+        if not self._channel.should_exit.is_set():
+            m.reply = controller.Reply(m)
+            await asyncio.run_coroutine_threadsafe(
+                self._channel.master.addons.handle_lifecycle(mtype, m),
+                self._channel.loop,
+            )
+            g = m.reply.q.get(block=False)
+            if g == exceptions.Kill:
+                raise exceptions.Kill()
+            return g
+
     def convert_certificate(self, cert: x509.Certificate) -> certs.Cert:
         return cert.Cert.from_pem(cert.public_bytes(Encoding.PEM))
 
@@ -178,17 +188,14 @@ class ProxyContext:
             ),
         )
 
-    async def ask(self, mtype, m):
-        if not self._channel.should_exit.is_set():
-            m.reply = controller.Reply(m)
-            await asyncio.run_coroutine_threadsafe(
-                self._channel.master.addons.handle_lifecycle(mtype, m),
-                self._channel.loop,
+    def log(
+            self, type: str, from_addr: Tuple[str, int], to_addr: Tuple[str, int], level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
+        ) -> None:
+        if additional is not None:
+            msg = ("\n" + " " * 6).join(
+                [f"[QUIC-{type}] {from_addr[0]}:{from_addr[1]} -> {to_addr}: {msg}"] + [f"{name}: {value}" for (name, value) in additional.items()]
             )
-            g = m.reply.q.get(block=False)
-            if g == exceptions.Kill:
-                raise exceptions.Kill()
-            return g
+        self.context.tell("log", log.LogEntry(msg, level.name))
 
     def tell(self, mtype, m):
         if not self._channel.should_exit.is_set():
@@ -275,7 +282,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
             )
             return
         bridge = self._bridges[event.stream_id]
-        bridge.post(self._side, event.data, is_data=True)
+        bridge.post_data(self._side, event.data, is_data=True)
 
     def _handle_http_headers_received(self, event: HeadersReceived) -> None:
         if event.stream_id not in self._bridges:
@@ -287,7 +294,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
             )
         else:
             bridge = self._bridges[event.stream_id]
-            bridge.post(self._side, event.headers, is_data=False)
+            bridge.post_data(self._side, event.headers, is_header=True)
 
     def _handle_http_event(self, event: H3Event) -> None:
         if isinstance(event, HeadersReceived):
@@ -335,14 +342,22 @@ class ConnectionProtocol(QuicConnectionProtocol):
             if bridge.server_stream_id != event.stream_id:
                 self.log(
                     LogLevel.warn,
-                    "Push data received on different stream_id.",
+                    "Push data received on different stream.",
                     event_description + {"push_stream_id": bridge.server_stream_id},
                 )
                 return
         else:
+            if event.stream_id in self._bridges:
+                self.log(
+                    LogLevel.warn,
+                    "Push data received on already assigned stream.",
+                    event_description,
+                )
+                return
             bridge.server_stream_id = event.stream_id
-        bridge.post(
-            ProxySide.server, event.data if is_data else event.data, is_data=is_data
+            self._bridges[event.stream_id] = bridge # necessary for stream reset 
+        bridge.post_data(
+            ProxySide.server, event.data if is_data else event.data
         )
 
     def _handle_http_push_promise_received(self, event: PushPromiseReceived) -> None:
@@ -411,8 +426,9 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 "Received reset for unknown stream.",
                 {"stream_id": event.stream_id},
             )
-        else:
-            self._bridges[event.stream_id].end_stream(self._side)
+            return
+        bridge = self._bridges[event.stream_id]
+        bridge.end_stream(self._side)
 
     def close(
         self,
@@ -447,15 +463,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
     def log(
         self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
     ) -> None:
-        if additional is not None:
-            msg = ("\n" + " " * 7).join(
-                [msg] + [f"{name}: {value}" for (name, value) in additional.items()]
-            )
-        self.context.tell("log", log.LogEntry(self.log_format(msg), level.name))
-
-    def log_format(self, msg: str) -> str:
-        # should be overridden in subclass
-        return msg
+        raise NotImplementedError
 
     def quic_event_received(self, event: QuicEvent) -> None:
         try:
@@ -491,11 +499,9 @@ class ConnectionProtocol(QuicConnectionProtocol):
 
 
 class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
-    def __init__(self, proto_in: IncomingProtocol, *args, **kwargs) -> None:
-        ConnectionProtocol.__init__(self, proto_in.context, *args, **kwargs)
+    def __init__(self, client: IncomingProtocol, *args, **kwargs) -> None:
+        ConnectionProtocol.__init__(self, client, self, *args, **kwargs)
         connections.ServerConnection.__init__(self, None, None, None)
-        self.proto_out = self
-        self.proto_in = proto_in
 
     @property
     def source_address(self) -> Tuple[str, int]:
@@ -506,8 +512,10 @@ class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
         if source_address is not None:
             raise PermissionError
 
-    def log_format(self, msg: str) -> str:
-        return f"[QUIC-out] {self.source_address[0]}:{self.source_address[1]} -> {self.address[0]}:{self.address[1]}: {msg}"
+    def log(
+        self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
+    ) -> None:
+        self.context.log("out", self.source_address, self.address, msg, additional)
 
     def handshake_complete(self, event: HandshakeCompleted) -> None:
         super().handshake_complete(event)
@@ -518,11 +526,15 @@ class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
 
 
 class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
-    def __init__(self, *args, **kwargs) -> None:
-        ConnectionProtocol.__init__(self, *args, **kwargs)
+    def __init__(self, context: ProxyContext, *args, **kwargs) -> None:
+        ConnectionProtocol.__init__(self, self, None, *args, **kwargs)
         connections.ClientConnection.__init__(self, None, None, None)
+        self._context: ProxyContext = context
         self._quic.tls.client_hello_cb = self._handle_client_hello
-        self.proto_in = self
+
+    @property
+    def context(self) -> ProxyContext:
+        return self._context
 
     @property
     def server(self) -> Tuple[str, int]:
@@ -540,9 +552,6 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
     def server(self, server):
         if server is not None:
             raise PermissionError
-
-    def log_format(self, msg: str) -> str:
-        return f"[QUIC-in] {self.address[0]}:{self.address[1]} -> {self.server[0]}:{self.server[1]}: {msg}"
 
     async def _create_outgoing_protocol(
         self,
@@ -674,6 +683,12 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         super().handshake_complete(event)
         self.mitmcert = self.context.convert_certificate(event.certificates[0])
 
+    def log(
+        self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
+    ) -> None:
+        self.context.log("in", self.address, self.server, msg, additional)
+
+
 
 class Bridge:
     def __init__(
@@ -687,12 +702,25 @@ class Bridge:
             asyncio.Event(),
             asyncio.Event(),
         )
-        asyncio.ensure_future(self.run())
+        self._sent_end_stream = Tuple[bool, bool] = (False, False)
+        asyncio.ensure_future(self._internal_run())
+
+    async def _internal_run(self) -> None:
+        # run the bridge and ensure the streams have been ended
+        try:
+            await self.run()
+        finally:
+            for side in ProxySide:
+                if not self.is_connection_closed(side) and not self.has_sent_end_stream(side):
+                    # TODO: replace with sending RESET_STREAM once aioquic supports it 
+                    proto = self.proto(side)
+                    proto._quic.send_stream_data(stream_id=self.stream_id(side), data=b"", end_stream=True)
+                    proto.transmit()
 
     @property
     def client(self) -> IncomingProtocol:
         return cast(IncomingProtocol, self.proto(ProxySide.client))
-
+    
     @property
     def context(self) -> ProxyContext:
         return self.client.context
@@ -735,11 +763,7 @@ class Bridge:
     def log(
         self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
     ) -> None:
-        if additional is not None:
-            msg = ("\n" + " " * 7).join(
-                [msg] + [f"{name}: {value}" for (name, value) in additional.items()]
-            )
-        self.context.tell("log", log.LogEntry(msg, level.name))
+        self.context.log("bridge", self.client.address, self.server.address is self.has_server() else self.client.server, level, msg, additional)
 
     def proto(self, side: ProxySide) -> ConnectionProtocol:
         proto = self._proto[side.value]
@@ -752,6 +776,27 @@ class Bridge:
 
     async def run(self) -> None:
         pass
+
+    def send(self, side:ProxySide, cb: Callable[[ConnectionProtocol, int], None], end_stream:bool)->None:
+        # ensure the connection is open and no end_stream was sent
+        if self.is_connection_closed(to_side):
+            raise FlowError(
+                502,
+                f"{'Client' if to_side is ProxySide.client else 'Server'} connection already closed.",
+            )
+        if self.has_sent_end_stream(side):
+            raise FlowError(500, f"{'Client' if to_side is ProxySide.client else 'Server'} stream has already been ended by proxy.")
+        
+        # send and transmit
+        proto = self.proto(side)
+        stream_id = self.stream_id(side)
+        cb(proto, stream_id)
+        if end_stream:
+            proto._quic.send_stream_data(stream_id, b"", end_stream=True)
+            sent_end_stream = list(self._sent_end_stream)
+            sent_end_stream[side.value] = True
+            self._sent_end_stream = tuple(sent_end_stream)
+        proto.transmit()
 
     @property
     def server(self) -> OutgoingProtocol:
@@ -838,26 +883,12 @@ class RawBridge(Bridge):
         server_stream_id: int,
     ) -> None:
         super().__init__((client, server), (client_stream_id, server_stream_id))
-        self._data_frames: List[Tuple[bytes, ProxySide]] = []
+        self._data_frames: Deque[Tuple[bytes, ProxySide]] = collections.deque()
         self._data_ready: asyncio.Event = asyncio.Event()
 
     def post_data(self, from_side: ProxySide, data: bytes) -> None:
         self._data_frames.append((data, from_side))
         self._data_ready.set()
-
-    def send(self, data: bytes, to_side: ProxySide) -> None:
-        if self.is_connection_closed(to_side):
-            raise FlowError(
-                502,
-                f"{'Client' if to_side is ProxySide.client else 'Server'} connection already closed.",
-            )
-        proto = self.proto(to_side)
-        proto._quic.send_stream_data(
-            stream_id=self.stream_id(to_side),
-            data=data,
-            end_stream=self.has_stream_ended(to_side.other_side),
-        )
-        proto.transmit()
 
     async def run(self) -> None:
         flow = tcp.TCPFlow(self.client, self.server, True)
@@ -866,22 +897,19 @@ class RawBridge(Bridge):
                 # pump all messages
                 # NOTE: This is done at the beginning on purpose, to raise an error
                 #       if there are any pending messages for a closed connection.
-                for data, from_side in self._data_frames:
+                while self._data_frames:
+                    data, from_side = self._data_frames.popleft()
                     tcp_message = tcp.TCPMessage(from_side is ProxySide.client, data)
                     flow.messages.append(tcp_message)
                     await self.context.ask("tcp_message", flow)
-                    self.send(tcp_message.content, from_side.other_side)
-
-                # clear the buffers and reset the event
-                self._data_frames.clear()
+                    self.send(from_side.other_side, tcp_message.content)
                 self._data_ready.clear()
 
                 # check if both connections and at least one stream is still alive
-                if (
-                    not self.is_any_connection_closed()
-                    and not self.have_all_streams_ended()
-                ):
+                if self.have_all_streams_ended():
                     break
+                if self.is_any_connection_closed():
+                    raise FlowError(502, "Connection closed before ending stream.")
 
                 # wait for more
                 await asyncio.wait(
@@ -899,6 +927,16 @@ class RawBridge(Bridge):
             flow.live = False
             self.context.tell("tcp_end", flow)
 
+    def send(self, to_side: ProxySide, data: bytes) -> None:
+        super().send(
+            to_side,
+            lambda proto, stream_id: proto._quic.send_stream_data(
+                stream_id=stream_id,
+                data=data,
+            ),
+            self.has_stream_ended(to_side.other_side)
+        )
+
 
 class HttpBridge(Bridge):
     def __init__(
@@ -914,6 +952,12 @@ class HttpBridge(Bridge):
         self._headers: Headers = headers
         self._is_push: bool = is_push
         self._origin: ProxySide = ProxySide.server if is_push else ProxySide.client
+        self._data_frames: Deque[Tuple[True, bytes, ProxySide]] = collections.deque()
+        self._data_ready: asyncio.Event = asyncio.Event()
+
+    def post_data(self, from_side: ProxySide, data: bytes, is_header:bool =False) -> None:
+        self._data_frames.append((is_header, data, from_side))
+        self._data_ready.set()
 
     def _parse_headers_and_set_request(self, flow: http.HTTPFlow) -> None:
         known_pseudo_headers: Dict[bytes, KnownPseudoHeaders] = {
@@ -1001,7 +1045,7 @@ class HttpBridge(Bridge):
                     raise ProtocolError(
                         f"Only 'websocket' is supported for :protocol header, got '{protocol.decode()}'."
                     )
-                flow.metadata[META_WEBSOCKET] = True
+                flow.metadata["websocket"] = True
                 scheme = require(KnownPseudoHeaders.scheme)
                 if scheme.lower() not in [b"http", b"https"]:
                     raise ProtocolError(
@@ -1104,7 +1148,7 @@ class HttpBridge(Bridge):
             )
         return header.startswith(b":")
 
-    def _handle_flow_error(self, exc: FlowException) -> None:
+    def _handle_flow_error(self, exc: FlowError) -> None:
         # try to send the status
         if not self.is_connection_closed(ProxySide.client):
             try:
@@ -1139,24 +1183,6 @@ class HttpBridge(Bridge):
                 )
             request.headers.add(header, value)
 
-    def respond(
-        self, headers: Headers = None, data: bytes = None, end_stream: bool = False
-    ) -> None:
-        target = self._origin.other_side
-        if self.is_connection_closed(target):
-            raise FlowError(
-                502,
-                f"{'Client' if target is ProxySide.client else 'Server'} connection already closed.",
-            )
-        proto = self.proto(target)
-        proto._http.send_data(
-            stream_id=self.stream_id(target),
-            headers=headers,
-            data=data,
-            end_stream=end_stream,
-        )
-        proto.transmit()
-
     async def run(self) -> None:
         try:
             self._parse_headers_and_set_request()
@@ -1183,12 +1209,12 @@ class HttpBridge(Bridge):
 
         # basically copied from mitmproxy
         if flow.request.headers.get("expect", "").lower() == "100-continue":
-            self.respond(headers=[(b":status", b"100")])
+            self.send(self._origin.other_side, headers=[(b":status", b"100")])
             flow.request.headers.pop("expect")
 
         # check for connect
         if flow.request.method == "CONNECT":
-            if flow.metadata[META_WEBSOCKET]:
+            if flow.metadata["websocket"]:
                 await self.run_websocket(flow)
             raise FlowError(501, "CONNECT for QUIC not implemented.")
 
@@ -1236,23 +1262,48 @@ class HttpBridge(Bridge):
         else:
             self.send_http(flow, headers=flow.response.headers, end_flow=False)
 
-    async def run_websocket(self, handshake_flow: http.HTTPFlow) -> None:
-        await self.ensure_server()
-        self.send(headers=self.build_request_headers(handshake_flow))
-        await self.wait_for_headers(self._origin.other_side)
+    async def _pump_websocket_data(self, ws: Tuple[wsproto.Connection]) -> bool:
+        # pump all messages
+        while self._data_frames:
+            is_header, data, from_side = self._data_frames.pop_left()
+            if is_header:
+                raise FlowError(502, "Headers received in websocket flow.")
+            ws[from_side.value]
+            tcp_message = tcp.TCPMessage(from_side is ProxySide.client, data)
+            flow.messages.append(tcp_message)
+            await self.context.ask("tcp_message", flow)
+            self.send(from_side.other_side, tcp_message.content)
+        self._data_ready.clear()
 
+    async def _wait_for_websocket_data(self) -> None:
+        # check if both connections and at least one stream is still alive
+        if self.have_all_streams_ended():
+            raise FlowError(502, "Streams have been closed before ending websocket.")
+        if self.is_any_connection_closed():
+            raise FlowError(502, "Connection closed before ending websocket.")
 
-        await self.request(handshake_flow)
-        if handshake_flow.response.status_code < 200 or handshake_flow.response.status_code >= 300:
-            await self.respond(handshake_flow)
-            return
+        # wait for more
+        await asyncio.wait(
+            {
+                self.wait_for_any_connection_closed(),
+                self.wait_for_all_streams_ended(),
+                self._data_ready.wait(),
+            },
+            return_when=asyncio.FIRST_COMPLETED,
+        )
 
-        ws_flow = webwocket.WebSocketFlow(self.client, self.server, self.flow)
+    async def run_websocket(self) -> None:
+        ws_flow = websocket.WebSocketFlow(self.client, self.server, self.flow)
+        ws_flow.stream = True
         ws_flow.metadata['websocket_handshake'] = self.flow.id
         self.flow.metadata['websocket_flow'] = ws_flow.id
-        self.context.ask("websocket_start", ws_flow)
+        await self.context.ask("websocket_start", ws_flow)
         try:
-
+            if not ws_flow.stream:
+                raise FlowError(500, "Only streamed websocket flows are supported.")
+            ws: Tuple[wsproto.Connection] = (wsproto.Connection(wsproto.ConnectionType.SERVER),wsproto.Connection(wsproto.ConnectionType.CLIENT))
+            while await self._pump_websocket_data(ws):
+                await self._wait_for_websocket_data()
         except FlowError as exc:
             self._handle_flow_error(exc)
             ws_flow.error = baseflow.Error(exc.message)
@@ -1264,6 +1315,18 @@ class HttpBridge(Bridge):
         finally:
             self.flow.live = False
             self.context.tell("websocket_end", ws_flow)
+
+    def send(self, to_side: ProxySide, headers: Optional[Headers] = None, data: Optional[bytes] =None, end_stream:bool = False) -> None:
+        super().send(
+            to_side,
+            lambda proto, stream_id: (
+                if headers is not None:
+                    proto._http.send_headers(stream_id, headers)
+                if data is not None:
+                    proto._http.send_data(stream_id, data)
+            ),
+            end_stream
+        )
 
 class SessionTicketStore:
     def __init__(self) -> None:
