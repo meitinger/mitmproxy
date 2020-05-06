@@ -20,9 +20,11 @@ from mitmproxy import log
 from mitmproxy import options as moptions
 from mitmproxy import proxy
 from mitmproxy import tcp
+from mitmproxy import websocket
 from mitmproxy.net.http import url
 
 import OpenSSL
+import wsproto
 
 import certifi
 from cryptography import x509
@@ -908,6 +910,7 @@ class HttpBridge(Bridge):
         is_push: bool = False,
     ) -> None:
         super().__init__((client, server), (stream_id, None))
+        self._flow: http.HTTPFlow = http.HTTPFlow(self.client, self.server, True, self.context.mode.name)
         self._headers: Headers = headers
         self._is_push: bool = is_push
         self._origin: ProxySide = ProxySide.server if is_push else ProxySide.client
@@ -1101,6 +1104,30 @@ class HttpBridge(Bridge):
             )
         return header.startswith(b":")
 
+    def _handle_flow_error(self, exc: FlowException) -> None:
+        # try to send the status
+        if not self.is_connection_closed(ProxySide.client):
+            try:
+                self.client._http.send_headers(
+                    self.stream_id(ProxySide.client),
+                    [
+                        (b":status", exc.status),
+                        (b"server", SERVER_NAME.encode()),
+                        (b"date", formatdate(time.time(), usegmt=True).encode()),
+                    ],
+                    end_stream=True,
+                )
+            except FrameUnexpected:
+                pass
+            else:
+                self.client.transmit()
+
+    def _handle_protocol_error(self, exc: ProtocolError) -> None:
+        # close the connection (will be logged when ConnectionTerminated is handled)
+        self.client.close(
+            error_code=exc.error_code, reason_phrase=exc.reason_phrase
+        )
+
     def _update_request_headers(
         self, request: http.HTTPRequest, headers: Headers
     ) -> None:
@@ -1131,45 +1158,26 @@ class HttpBridge(Bridge):
         proto.transmit()
 
     async def run(self) -> None:
-        flow = http.HTTPFlow(self.client, self.server, True, self.context.mode.name)
         try:
-            self._parse_headers_and_set_request(flow)
-            await (self.run_push(flow) if self._is_push else self.run_request(flow))
+            self._parse_headers_and_set_request()
+            await (self.run_push() if self._is_push else self.run_request())
         except FlowError as exc:
-            # try to send the status
-            if not self.is_connection_closed(ProxySide.client):
-                try:
-                    self.client._http.send_headers(
-                        self.stream_id(ProxySide.client),
-                        [
-                            (b":status", exc.status),
-                            (b"server", SERVER_NAME.encode()),
-                            (b"date", formatdate(time.time(), usegmt=True).encode()),
-                        ],
-                        end_stream=True,
-                    )
-                except FrameUnexpected:
-                    pass
-                else:
-                    self.client.transmit()
-            flow.error = baseflow.Error(exc.message)
-            await self.context.ask("error", flow)
+            self._handle_flow_error(exc)
+            self.flow.error = baseflow.Error(exc.message)
+            await self.context.ask("error", self.flow)
         except ProtocolError as exc:
-            # close the connection (will be logged when ConnectionTerminated is handled)
-            self.client.close(
-                error_code=exc.error_code, reason_phrase=exc.reason_phrase
-            )
-            flow.error = baseflow.Error(exc.reason_phrase)
-            await self.context.ask("error", flow)
+            self._handle_protocol_error(exc)
+            self.flow.error = baseflow.Error(exc.reason_phrase)
+            await self.context.ask("error", self.flow)
         finally:
-            flow.live = False
+            self.flow.live = False
 
-    async def run_push(self, flow: http.HTTPFlow) -> None:
+    async def run_push(self) -> None:
         # set flag and allow patching
         flow.metadata["h2-pushed-stream"] = True
-        await self.context.ask("requestheaders", flow)
+        await self.context.ask("requestheaders", self.flow)
 
-    async def run_request(self, flow: http.HTTPFlow) -> None:
+    async def run_request(self) -> None:
         # allow patching
         await self.context.ask("requestheaders", flow)
 
@@ -1180,12 +1188,9 @@ class HttpBridge(Bridge):
 
         # check for connect
         if flow.request.method == "CONNECT":
-            raise FlowError(
-                501,
-                "Websockets not yet implemented."
-                if flow.metadata[META_WEBSOCKET]
-                else "CONNECT for QUIC not implemented.",
-            )
+            if flow.metadata[META_WEBSOCKET]:
+                await self.run_websocket(flow)
+            raise FlowError(501, "CONNECT for QUIC not implemented.")
 
         # handle different content scenarios
         if flow.request.stream:
@@ -1231,6 +1236,34 @@ class HttpBridge(Bridge):
         else:
             self.send_http(flow, headers=flow.response.headers, end_flow=False)
 
+    async def run_websocket(self, handshake_flow: http.HTTPFlow) -> None:
+        await self.ensure_server()
+        self.send(headers=self.build_request_headers(handshake_flow))
+        await self.wait_for_headers(self._origin.other_side)
+
+
+        await self.request(handshake_flow)
+        if handshake_flow.response.status_code < 200 or handshake_flow.response.status_code >= 300:
+            await self.respond(handshake_flow)
+            return
+
+        ws_flow = webwocket.WebSocketFlow(self.client, self.server, self.flow)
+        ws_flow.metadata['websocket_handshake'] = self.flow.id
+        self.flow.metadata['websocket_flow'] = ws_flow.id
+        self.context.ask("websocket_start", ws_flow)
+        try:
+
+        except FlowError as exc:
+            self._handle_flow_error(exc)
+            ws_flow.error = baseflow.Error(exc.message)
+            await self.context.tell("websocket_error", ws_flow)
+        except ProtocolError as exc:
+            self._handle_protocol_error(exc)
+            ws_flow.error = baseflow.Error(exc.reason_phrase)
+            await self.context.tell("websocket_error", ws_flow)
+        finally:
+            self.flow.live = False
+            self.context.tell("websocket_end", ws_flow)
 
 class SessionTicketStore:
     def __init__(self) -> None:
