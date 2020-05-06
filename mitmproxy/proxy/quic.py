@@ -753,7 +753,7 @@ class Bridge:
     def end_stream(self, side: ProxySide) -> None:
         self._stream_ended[side.value].set()
 
-    def has_sent_end_stream(self, side:ProxySide) -> bool:
+    def has_sent_end_stream(self, side: ProxySide) -> bool:
         return self._sent_end_stream[side.value]
 
     def has_server(self) -> bool:
@@ -993,6 +993,9 @@ class HttpBridge(Bridge):
         self._origin: ProxySide = ProxySide.server if is_push else ProxySide.client
         self._data_frames: Deque[Tuple[True, bytes, ProxySide]] = collections.deque()
         self._data_ready: asyncio.Event = asyncio.Event()
+        self._ws_flow: websocket.WebSocketFlow
+        self._ws_connections: Tuple[wsproto.Connection, wsproto.Connection]
+        self._ws_buffers: Tuple[List[Union[bytes, str]], List[Union[bytes, str]]]
 
     def post_data(
         self, from_side: ProxySide, data: bytes, is_header: bool = False
@@ -1211,6 +1214,95 @@ class HttpBridge(Bridge):
         # close the connection (will be logged when ConnectionTerminated is handled)
         self.client.close(error_code=exc.error_code, reason_phrase=exc.reason_phrase)
 
+    async def _handle_websocket_close_connection(
+        self, from_side: ProxySide, event: wsproto.events.CloseConnection
+    ) -> None:
+        # set the flow properties
+        self._ws_flow.close_sender = from_side.name
+        self._ws_flow.close_code = event.code
+        self._ws_flow.close_reason = event.reason
+
+        # forward the close and respond to the message
+        self.send(
+            from_side.other_side,
+            data=self._ws_connections[from_side.other_side.value].send(
+                wsproto.events.CloseConnection(code=event.code, reason=event.reason)
+            ),
+            end_stream=True,
+        )
+        self.send(
+            from_side,
+            data=self._ws_connections[from_side.value].send(event.response()),
+            end_stream=True,
+        )
+
+    async def _handle_websocket_message(
+        self, from_side: ProxySide, event: wsproto.events.Message
+    ) -> None:
+        # copied from mitmproxy
+        fb = self._ws_buffers[from_side.value]
+        fb.append(event.data)
+
+        if event.message_finished:
+            original_chunk_sizes = [len(f) for f in fb]
+
+            if isinstance(event, wsproto.events.TextMessage):
+                message_type = wsproto.frame_protocol.Opcode.TEXT
+                payload = "".join(fb)
+            else:
+                message_type = wsproto.frame_protocol.Opcode.BINARY
+                payload = b"".join(fb)
+
+            fb.clear()
+
+            websocket_message = websocket.WebSocketMessage(
+                message_type, from_side is ProxySide.client, payload
+            )
+            length = len(websocket_message.content)
+            self._ws_flow.messages.append(websocket_message)
+            await self.context.ask("websocket_message", self._ws_flow)
+
+            if not self._ws_flow.stream and not websocket_message.killed:
+
+                def get_chunk(payload):
+                    if len(payload) == length:
+                        # message has the same length, we can reuse the same sizes
+                        pos = 0
+                        for s in original_chunk_sizes:
+                            yield (
+                                payload[pos : pos + s],
+                                True if pos + s == length else False,
+                            )
+                            pos += s
+                    else:
+                        # just re-chunk everything into 4kB frames
+                        # header len = 4 bytes without masking key and 8 bytes with masking key
+                        chunk_size = 4092 if from_side is ProxySide.server else 4088
+                        chunks = range(0, len(payload), chunk_size)
+                        for i in chunks:
+                            yield (
+                                payload[i : i + chunk_size],
+                                True if i + chunk_size >= len(payload) else False,
+                            )
+
+                for chunk, final in get_chunk(websocket_message.content):
+                    self.send(
+                        from_side.other_side,
+                        data=self._ws_connections[from_side.other_side.value].send(
+                            wsproto.events.Message(data=chunk, message_finished=final)
+                        ),
+                    )
+
+        if self._ws_flow.stream:
+            self.send(
+                from_side.other_side,
+                data=self._ws_connections[from_side.other_side.value].send(
+                    wsproto.events.Message(
+                        data=event.data, message_finished=event.message_finished
+                    )
+                ),
+            )
+
     def _update_request_headers(
         self, request: http.HTTPRequest, headers: Headers
     ) -> None:
@@ -1222,14 +1314,29 @@ class HttpBridge(Bridge):
                 )
             request.headers.add(header, value)
 
-    async def _pump_websocket_data(self, ws: Tuple[wsproto.Connection]) -> bool:
+    async def _pump_websocket_data(self) -> bool:
         # pump all messages
         while self._data_frames:
             is_header, data, from_side = self._data_frames.popleft()
             if is_header:
-                raise FlowError(502, "Headers received in websocket flow.")
-
+                raise FlowError(
+                    502, f"Headers received in websocket flow from {from_side.name}."
+                )
+            ws = self._ws_connections[from_side.value]
+            ws.receive_data(data)
+            for event in ws.events():
+                if isinstance(event, wsproto.events.Message):
+                    await self._handle_websocket_message(from_side, event)
+                elif isinstance(event, wsproto.events.CloseConnection):
+                    await self._handle_websocket_close_connection(from_side, event)
+                    return False
+                else:
+                    self.log(
+                        LogLevel.debug,
+                        f"Unknown websocket event '{type(event).__name__}' received from {from_side.name}.",
+                    )
         self._data_ready.clear()
+        return True
 
     async def _wait_for_websocket_data(self) -> None:
         # check if both connections and at least one stream is still alive
@@ -1328,31 +1435,29 @@ class HttpBridge(Bridge):
             self.send_http(flow, headers=flow.response.headers, end_flow=False)
 
     async def run_websocket(self) -> None:
-        ws_flow = websocket.WebSocketFlow(self.client, self.server, self._flow)
-        ws_flow.stream = True
-        ws_flow.metadata["websocket_handshake"] = self._flow.id
-        self._flow.metadata["websocket_flow"] = ws_flow.id
-        await self.context.ask("websocket_start", ws_flow)
+        self._ws_flow = websocket.WebSocketFlow(self.client, self.server, self._flow)
+        self._ws_flow.metadata["websocket_handshake"] = self._flow.id
+        self._flow.metadata["websocket_flow"] = self._ws_flow.id
+        await self.context.ask("websocket_start", self._ws_flow)
         try:
-            if not ws_flow.stream:
-                raise FlowError(500, "Only streamed websocket flows are supported.")
-            ws: Tuple[wsproto.Connection] = (
+            self._ws_connections = (
                 wsproto.Connection(wsproto.ConnectionType.SERVER),
                 wsproto.Connection(wsproto.ConnectionType.CLIENT),
             )
-            while await self._pump_websocket_data(ws):
+            self._ws_buffers = (list(), list())
+            while await self._pump_websocket_data():
                 await self._wait_for_websocket_data()
         except FlowError as exc:
             self._handle_flow_error(exc)
-            ws_flow.error = baseflow.Error(exc.message)
-            await self.context.tell("websocket_error", ws_flow)
+            self._ws_flow.error = baseflow.Error(exc.message)
+            await self.context.tell("websocket_error", self._ws_flow)
         except ProtocolError as exc:
             self._handle_protocol_error(exc)
-            ws_flow.error = baseflow.Error(exc.reason_phrase)
-            await self.context.tell("websocket_error", ws_flow)
+            self._ws_flow.error = baseflow.Error(exc.reason_phrase)
+            await self.context.tell("websocket_error", self._ws_flow)
         finally:
             self._flow.live = False
-            self.context.tell("websocket_end", ws_flow)
+            self.context.tell("websocket_end", self._ws_flow)
 
     def send(
         self,
