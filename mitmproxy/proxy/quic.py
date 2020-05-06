@@ -389,12 +389,13 @@ class ConnectionProtocol(QuicConnectionProtocol):
             )
             return
         if event.stream_id not in self._bridges:
-            # only log but continue
+            # a bidirectional channel is needed
             self.log(
-                LogLevel.info,
+                LogLevel.warn,
                 "Push promise received on unknown stream.",
                 event_description,
             )
+            return
         if event.push_id in self._push_bridges:
             # log and exit
             self.log(
@@ -406,7 +407,8 @@ class ConnectionProtocol(QuicConnectionProtocol):
             server=self._server,
             stream_id=event.stream_id,
             headers=event.headers,
-            is_push=True,
+            push_id=event.push_id,
+            push_promise_to=self._bridges[event.stream_id],
         )
 
     def _handle_raw_stream_data(self, event: StreamDataReceived) -> None:
@@ -915,6 +917,7 @@ class Bridge:
 class RawBridge(Bridge):
     def __init__(
         self,
+        *,
         client: IncomingProtocol,
         client_stream_id: int,
         server: OutgoingProtocol,
@@ -978,19 +981,28 @@ class RawBridge(Bridge):
 class HttpBridge(Bridge):
     def __init__(
         self,
+        *,
         client: IncomingProtocol,
         server: Optional[OutgoingProtocol],
         stream_id: int,
         headers: Headers,
-        is_push: bool = False,
+        push_id: Optional[int] = None,
+        push_promise_to: Optional[HttpBridge] = None
     ) -> None:
+        if push_id is None ^ push_promise_to is None:
+            raise ValueError("push_id and push_promise_to must either both be set or both be None")
+        
         super().__init__((client, server), (stream_id, None))
         self._flow: http.HTTPFlow = http.HTTPFlow(
             self.client, self.server, True, self.context.mode.name
         )
+        self._is_push: bool = push_id is not None
+        if self._is_push:
+            self._flow.metadata["h2-pushed-stream"] = True
+        self._push_id: Optional[int] = push_id
+        self._push_bridge: Optional[HttpBridge] = push_promise_to
         self._headers: Headers = headers
-        self._is_push: bool = is_push
-        self._origin: ProxySide = ProxySide.server if is_push else ProxySide.client
+        self._origin: ProxySide = ProxySide.server if self._is_push else ProxySide.client
         self._data_frames: Deque[Tuple[True, bytes, ProxySide]] = collections.deque()
         self._data_ready: asyncio.Event = asyncio.Event()
         self._ws_flow: websocket.WebSocketFlow
@@ -1003,7 +1015,7 @@ class HttpBridge(Bridge):
         self._data_frames.append((is_header, data, from_side))
         self._data_ready.set()
 
-    def _parse_headers_and_set_request(self) -> None:
+    def _create_flow_request(self) -> None:
         known_pseudo_headers: Dict[bytes, KnownPseudoHeaders] = {
             b":" + x.name.encode(): x for x in KnownPseudoHeaders
         }
@@ -1034,7 +1046,7 @@ class HttpBridge(Bridge):
 
         # filter out known headers (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.3)
         for header, value in self._headers:
-            if self._check_header_and_is_pseudo(header):
+            if self._is_pseudo_header(header):
                 pseudo_header = known_pseudo_headers.get(header)
                 if pseudo_header is None:
                     raise ProtocolError(
@@ -1167,7 +1179,7 @@ class HttpBridge(Bridge):
             raise NotImplementedError
 
         # create the request object and return the flow
-        flow.requst = http.HTTPRequest(
+        return http.HTTPRequest(
             first_line_format,
             method,
             scheme,
@@ -1182,15 +1194,6 @@ class HttpBridge(Bridge):
             timestamp_start=time.time(),
             timestamp_end=None,
         )
-
-    def _check_header_and_is_pseudo(self, header: Optional[bytes]) -> bool:
-        if header is None:
-            raise ProtocolError("Empty header name is not allowed.")
-        if header != header.lower():
-            raise ProtocolError(
-                f"Uppercase header name '{header.decode()}' is not allowed."
-            )
-        return header.startswith(b":")
 
     def _handle_flow_error(self, exc: FlowError) -> None:
         # try to send the status
@@ -1303,12 +1306,21 @@ class HttpBridge(Bridge):
                 ),
             )
 
+    def _is_pseudo_header(self, header: Optional[bytes]) -> bool:
+        if header is None:
+            raise ProtocolError("Empty header name is not allowed.")
+        if header != header.lower():
+            raise ProtocolError(
+                f"Uppercase header name '{header.decode()}' is not allowed."
+            )
+        return header.startswith(b":")
+
     def _update_request_headers(
         self, request: http.HTTPRequest, headers: Headers
     ) -> None:
         # only allow non-pseudo headers (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.1.1)
         for header, value in headers:
-            if self._check_header_and_is_pseudo(header):
+            if self._is_pseudo_header(header):
                 raise ProtocolError(
                     f"Pseudo header '{header.decode()}' not allowed in trailers."
                 )
@@ -1338,6 +1350,9 @@ class HttpBridge(Bridge):
         self._data_ready.clear()
         return True
 
+    async def _read_request_data(self) -> bytes:
+        pass
+
     async def _wait_for_websocket_data(self) -> None:
         # check if both connections and at least one stream is still alive
         if self.have_all_streams_ended():
@@ -1357,8 +1372,42 @@ class HttpBridge(Bridge):
 
     async def run(self) -> None:
         try:
-            self._parse_headers_and_set_request()
-            await (self.run_push() if self._is_push else self.run_request())
+            # parse the headers and allow patching
+            self._flow.request = self._create_flow_request()
+            await self.context.ask("requestheaders", self._flow)
+
+            # CONNECT is only allowed for websockets
+            is_websocket: bool = self._flow.metadata["websocket"]
+            if self._flow.request.method == "CONNECT" and not is_websocket:
+                raise FlowError(501, "CONNECT for QUIC not implemented.")
+
+            # 100-continue is allowed, but not on a push (and it's a bit weird for the server to assume that)
+            if self._flow.request.headers.get("expect", "").lower() == "100-continue" and not self._is_push:
+                self.send(self._origin, headers=[(b":status", b"100")])
+                self._flow.request.headers.pop("expect")
+
+            # handle different content scenarios
+            if is_websocket or self._flow.request.stream:
+                self._flow.request.data.content = None
+            else:
+                self._flow.request.data.content = await self._read_request_data()
+
+            # request is done, log it
+            self._flow.request.timestamp_end = time.time()
+            self.log(LogLevel.debug, None, {"request": repr(self._flow.request), "push": self._is_push, "websocket": is_websocket, "origin": self._origin.name})
+
+            # update host header in reverse proxy mode
+            if (
+                self.context.mode is ProxyMode.reverse
+                and not self.context.options.keep_host_header
+            ):
+                self._flow.request.host_header = self.context.upstream_or_reverse_address
+
+            # allow pre-recorded reponses
+            await self.context.ask("request", self._flow)
+            if is_websocket:
+                await self.context.ask("websocket_handshake", self._flow)
+    
         except FlowError as exc:
             self._handle_flow_error(exc)
             self._flow.error = baseflow.Error(exc.message)
@@ -1375,37 +1424,15 @@ class HttpBridge(Bridge):
         self._flow.metadata["h2-pushed-stream"] = True
         await self.context.ask("requestheaders", self._flow)
 
+
+
     async def run_request(self) -> None:
-        # allow patching
-        await self.context.ask("requestheaders", self._flow)
+  
 
-        # basically copied from mitmproxy
-        if self._flow.request.headers.get("expect", "").lower() == "100-continue":
-            self.send(self._origin.other_side, headers=[(b":status", b"100")])
-            self._flow.request.headers.pop("expect")
 
-        # check for connect
-        if self._flow.request.method == "CONNECT":
-            if self._flow.metadata["websocket"]:
-                await self.run_websocket()
-            raise FlowError(501, "CONNECT for QUIC not implemented.")
 
-        # handle different content scenarios
-        if self._flow.request.stream:
-            self._flow.request.data.content = None
-        else:
-            self._flow.request.data.content = b""
 
-        # request is done
-        self._flow.request.timestamp_end = time.time()
-        self.log("request", "debug", [repr(self._flow.request)])
 
-        # update host header in reverse proxy mode
-        if (
-            self.context.mode is ProxyMode.reverse
-            and not self.context.options.keep_host_header
-        ):
-            self._flow.request.host_header = self.context.upstream_or_reverse_address
 
         await self.context.ask("request", self._flow)
 
@@ -1435,6 +1462,7 @@ class HttpBridge(Bridge):
             self.send_http(flow, headers=flow.response.headers, end_flow=False)
 
     async def run_websocket(self) -> None:
+        # handle the websocket flow after negotiation
         self._ws_flow = websocket.WebSocketFlow(self.client, self.server, self._flow)
         self._ws_flow.metadata["websocket_handshake"] = self._flow.id
         self._flow.metadata["websocket_flow"] = self._ws_flow.id
