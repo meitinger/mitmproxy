@@ -10,6 +10,7 @@ import time
 import traceback
 from email.utils import formatdate
 from typing import (
+    Any,
     cast,
     Callable,
     Coroutine,
@@ -158,7 +159,7 @@ class ProxyContext:
                     self._channel.master.addons.handle_lifecycle(mtype, m),
                     self._channel.loop,
                 ).result()
-            g = m.reply.q.get(block=False)
+            g = m.reply.q.get()
             if g == exceptions.Kill:
                 raise exceptions.Kill()
             return g
@@ -223,11 +224,31 @@ class ProxyContext:
     def tell(self, mtype, m):
         if not self._channel.should_exit.is_set():
             m.reply = controller.DummyReply()
-            asyncio.run_coroutine_threadsafe(
-                self._channel.master.addons.handle_lifecycle(mtype, m),
-                self._channel.loop,
-            )
+            if asyncio.get_event_loop() is self._channel.loop:
+                asyncio.ensure_future(
+                    self._channel.master.addons.handle_lifecycle(mtype, m)
+                )
+            else:
+                asyncio.run_coroutine_threadsafe(
+                    self._channel.master.addons.handle_lifecycle(mtype, m),
+                    self._channel.loop,
+                )
 
+
+def handle_except(loggable: Any) -> None:
+    exc_type, exc, tb = sys.exc_info()
+    try:
+        loggable.log(
+            LogLevel.error,
+            "Unhandled exception.",
+            {
+                "type": exc_type.__name__,
+                "message": str(exc),
+                "stacktrace": "\n" + "".join(traceback.format_tb(tb)),
+            },
+        )
+    except:
+        traceback.print_tb(tb, file=sys.stderr)
 
 class ConnectionProtocol(QuicConnectionProtocol):
     def __init__(
@@ -493,36 +514,21 @@ class ConnectionProtocol(QuicConnectionProtocol):
         raise NotImplementedError
 
     def quic_event_received(self, event: QuicEvent) -> None:
-        try:
-            try:
-                # handle known events
-                if isinstance(event, HandshakeCompleted):
-                    self.handshake_complete(event)
-                elif isinstance(event, ConnectionTerminated):
-                    self._handle_connection_terminated(event)
-                elif isinstance(event, StreamReset):
-                    self._handle_stream_reset(event)
-                elif isinstance(event, StreamDataReceived):
-                    if self._http is None:
-                        self._handle_raw_stream_data(event)
-                    else:
-                        for http_event in self._http.handle_event(event):
-                            self._handle_http_event(http_event)
-                    if event.end_stream and event.stream_id in self._bridges:
-                        self._bridges[event.stream_id].end_stream(self._side)
-            except Exception as exc:
-                self.log(
-                    LogLevel.error,
-                    "Exception during event handling.",
-                    {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                        "stacktrace": "\n" + traceback.format_exc(),
-                    },
-                )
-        except:
-            # when even logging fails
-            traceback.print_exc(file=sys.stderr)
+        # handle known events
+        if isinstance(event, HandshakeCompleted):
+            self.handshake_complete(event)
+        elif isinstance(event, ConnectionTerminated):
+            self._handle_connection_terminated(event)
+        elif isinstance(event, StreamReset):
+            self._handle_stream_reset(event)
+        elif isinstance(event, StreamDataReceived):
+            if self._http is None:
+                self._handle_raw_stream_data(event)
+            else:
+                for http_event in self._http.handle_event(event):
+                    self._handle_http_event(http_event)
+            if event.end_stream and event.stream_id in self._bridges:
+                self._bridges[event.stream_id].end_stream(self._side)
 
 
 class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
@@ -553,6 +559,13 @@ class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
             self.context.convert_certificate(cert) for cert in event.certificates[1:]
         ]
 
+    def datagram_received(
+        self, data: bytes, addr: Tuple, orig_dst: Optional[Tuple] = None
+    ) -> None:
+        try:
+            super().datagram_received(data, addr, orig_dst)
+        except:
+            handle_except(self)
 
 class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
     def __init__(self, context: ProxyContext, *args, **kwargs) -> None:
@@ -702,31 +715,31 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
             self._process_events()
             self.transmit()
         except:
-            traceback.print_exc(file=sys.stderr)
+            handle_except(self)
 
     def datagram_received(
         self, data: bytes, addr: Tuple, orig_dst: Optional[Tuple] = None
     ) -> None:
-        if self.tls_established:
-            try:
+        try:
+            if self.tls_established:
                 self._quic.receive_datagram(
                     cast(bytes, data), addr, self._loop.time(), orig_dst
                 )
                 self._process_events()
                 self.transmit()
-            except:
-                traceback.print_exc(file=sys.stderr)
-        else:
-            # everything before the handshake must happen in a different thread
-            # to support blocking for the client, since QuicConnection is not async
-            self._loop.run_in_executor(
-                None,
-                self._quic.receive_datagram,
-                bytes(data),
-                addr,
-                self._loop.time(),
-                orig_dst,
-            ).add_done_callback(self._process_events_and_transmit)
+            else:
+                # everything before the handshake must happen in a different thread
+                # to support blocking for the client, since QuicConnection is not async
+                self._loop.run_in_executor(
+                    None,
+                    self._quic.receive_datagram,
+                    bytes(data),
+                    addr,
+                    self._loop.time(),
+                    orig_dst,
+                ).add_done_callback(self._process_events_and_transmit)
+        except:
+            handle_except(self)
 
     def handshake_complete(self, event: HandshakeCompleted) -> None:
         super().handshake_complete(event)
@@ -736,7 +749,6 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
     ) -> None:
         self.context.log("in", self.address, self.server, level, msg, additional)
-
 
 class Bridge:
     def __init__(
@@ -755,38 +767,26 @@ class Bridge:
 
     async def _internal_run(self) -> None:
         try:
+            # run the bridge and ensure the streams have been ended
             try:
-                # run the bridge and ensure the streams have been ended
-                try:
-                    await self.run()
-                finally:
-                    for side in ProxySide:
-                        if (
-                            (side is ProxySide.client or self.has_server_stream_id())
-                            and not self.is_connection_closed(side)
-                            and not self.has_sent_end_stream(side)
-                        ):
-                            # TODO: replace with sending RESET_STREAM once aioquic supports it
-                            proto = self.proto(side)
-                            proto._quic.send_stream_data(
-                                stream_id=self.stream_id(side),
-                                data=b"",
-                                end_stream=True,
-                            )
-                            proto.transmit()
-            except Exception as exc:
-                self.log(
-                    LogLevel.error,
-                    "Exception while running bridge.",
-                    {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                        "stacktrace": "\n" + traceback.format_exc(),
-                    },
-                )
+                await self.run()
+            finally:
+                for side in ProxySide:
+                    if (
+                        (side is ProxySide.client or self.has_server_stream_id())
+                        and not self.is_connection_closed(side)
+                        and not self.has_sent_end_stream(side)
+                    ):
+                        # TODO: replace with sending RESET_STREAM once aioquic supports it
+                        proto = self.proto(side)
+                        proto._quic.send_stream_data(
+                            stream_id=self.stream_id(side),
+                            data=b"",
+                            end_stream=True,
+                        )
+                        proto.transmit()
         except:
-            # when even logging fails
-            traceback.print_exc(file=sys.stderr)
+            handle_except(self)
 
     @property
     def client(self) -> IncomingProtocol:
@@ -982,6 +982,7 @@ class RawBridge(Bridge):
 
     async def run(self) -> None:
         flow = tcp.TCPFlow(self.client, self.server, True)
+        await self.context.ask("tcp_start", flow)
         try:
             while True:
                 # pump all messages
