@@ -3,6 +3,7 @@ import asyncio
 import collections
 import enum
 import functools
+import ssl
 import socket
 import sys
 import time
@@ -150,17 +151,20 @@ class ProxyContext:
     async def ask(self, mtype, m):
         if not self._channel.should_exit.is_set():
             m.reply = controller.Reply(m)
-            await asyncio.run_coroutine_threadsafe(
-                self._channel.master.addons.handle_lifecycle(mtype, m),
-                self._channel.loop,
-            )
+            if asyncio.get_event_loop() is self._channel.loop:
+                await self._channel.master.addons.handle_lifecycle(mtype, m)
+            else:
+                await asyncio.run_coroutine_threadsafe(
+                    self._channel.master.addons.handle_lifecycle(mtype, m),
+                    self._channel.loop,
+                ).result()
             g = m.reply.q.get(block=False)
             if g == exceptions.Kill:
                 raise exceptions.Kill()
             return g
 
-    def convert_certificate(self, cert: x509.Certificate) -> certs.Cert:
-        return cert.Cert.from_pem(cert.public_bytes(Encoding.PEM))
+    def convert_certificate(self, certificate: x509.Certificate) -> certs.Cert:
+        return certs.Cert.from_pem(certificate.public_bytes(Encoding.PEM))
 
     def generate_certificate(
         self,
@@ -282,7 +286,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
         )
 
         # close the server connection (if any) as well
-        if self._side is ProxySide.client and self._server is None:
+        if self._side is ProxySide.client and self._server is not None:
             self._server.close(
                 error_code=event.error_code,
                 frame_type=event.frame_type,
@@ -301,7 +305,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
             )
             return
         bridge = self._bridges[event.stream_id]
-        bridge.post_data(self._side, event.data, is_data=True)
+        bridge.post_data(self._side, event.data)
 
     def _handle_http_headers_received(self, event: HeadersReceived) -> None:
         if event.stream_id not in self._bridges:
@@ -375,7 +379,11 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 return
             bridge.server_stream_id = event.stream_id
             self._bridges[event.stream_id] = bridge  # necessary for stream reset
-        bridge.post_data(ProxySide.server, event.data if is_data else event.data)
+        bridge.post_data(
+            ProxySide.server,
+            event.data if is_data else event.headers,
+            is_header=not is_data,
+        )
 
     def _handle_http_push_promise_received(self, event: PushPromiseReceived) -> None:
         event_description = {
@@ -509,7 +517,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
                     {
                         "type": type(exc).__name__,
                         "message": str(exc),
-                        "stacktrace": traceback.format_stack(),
+                        "stacktrace": "\n" + traceback.format_exc(),
                     },
                 )
         except:
@@ -534,7 +542,9 @@ class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
     def log(
         self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
     ) -> None:
-        self.context.log("out", self.source_address, self.address, msg, additional)
+        self.context.log(
+            "out", self.source_address, self.address, level, msg, additional
+        )
 
     def handshake_complete(self, event: HandshakeCompleted) -> None:
         super().handshake_complete(event)
@@ -549,7 +559,15 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         ConnectionProtocol.__init__(self, self, None, *args, **kwargs)
         connections.ClientConnection.__init__(self, None, None, None)
         self._context: ProxyContext = context
-        self._quic.tls.client_hello_cb = self._handle_client_hello
+        orig_initialize = self._quic._initialize
+
+        def initialize_replacement(*args, **kwargs):
+            try:
+                return orig_initialize(*args, **kwargs)
+            finally:
+                self._quic.tls.client_hello_cb = self._handle_client_hello
+
+        self._quic._initialize = initialize_replacement
 
     @property
     def context(self) -> ProxyContext:
@@ -585,6 +603,11 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
                 is_client=True,
                 server_name=sni,
                 secrets_log_file=log_master_secret,
+                verify_mode=ssl.CERT_NONE
+                if self.context.options.ssl_insecure
+                else ssl.CERT_REQUIRED,
+                cafile=self.context.options.ssl_verify_upstream_trusted_ca,
+                capath=self.context.options.ssl_verify_upstream_trusted_confdir,
             )
         )
         if self.context.options.spoof_source_address:
@@ -595,7 +618,7 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         )
         protocol = cast(QuicConnectionProtocol, protocol)
         protocol.connect(remote_addr)
-        await protocol.wait_connect()
+        await protocol.wait_connected()
         return protocol
 
     def _handle_client_hello(self, hello: ClientHello) -> None:
@@ -616,21 +639,24 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         #       flow. However, in order to allow the inspection of any stream data, this would require
         #       something like `ask("alpn_protocol", flow)` to also record and replay the selected protocol.
         if self.context.mode is not ProxyMode.regular:
-            self.proto_out = asyncio.run_coroutine_threadsafe(
+            self._server = asyncio.run_coroutine_threadsafe(
                 self._create_outgoing_protocol(
                     remote_addr=self.server
                     if self.context.mode is ProxyMode.transparent
-                    else self.context.upstream_or_reverse_address,
+                    else (
+                        self.context.upstream_or_reverse_address[0].decode("idna"),
+                        self.context.upstream_or_reverse_address[1],
+                    ),
                     sni=hello.server_name,
                     alpn_protocols=hello.alpn_protocols,
                 ),
                 self._loop,
             ).result()
-            tls.alpn_negotiated = self.proto_out.alpn_proto_negotiated
+            tls.alpn_negotiated = self._server.alpn_proto_negotiated.decode()
 
             # copy over all possible certificate data if requested
             if self.context.options.upstream_cert:
-                upstream_cert = self.proto_out.cert
+                upstream_cert = self._server.cert
                 sans.update(upstream_cert.altnames)
                 if upstream_cert.cn:
                     host = upstream_cert.cn.decode("utf8").encode("idna")
@@ -638,16 +664,14 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
                 if upstream_cert.organization:
                     organization = upstream_cert.organization
             if self.context.options.add_upstream_certs_to_client_chain:
-                extra_chain = self.proto_out.server_certs
+                extra_chain = self._server.server_certs
 
         # add the name of server name of the reverse target or upstream proxy
         if (
             self.context.mode is ProxyMode.upstream
             or self.context.mode is ProxyMode.reverse
         ):
-            upstream_or_reverse_host = self.context.upstream_or_reverse_address[
-                0
-            ].encode("idna")
+            upstream_or_reverse_host = self.context.upstream_or_reverse_address[0]
             sans.add(upstream_or_reverse_host)
             if host is None:
                 host = upstream_or_reverse_host
@@ -673,9 +697,12 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         )
 
     def _process_events_and_transmit(self, future: asyncio.Future) -> None:
-        future.result()
-        self._process_events()
-        self.transmit()
+        try:
+            future.result()
+            self._process_events()
+            self.transmit()
+        except:
+            traceback.print_exc(file=sys.stderr)
 
     def datagram_received(
         self, data: bytes, addr: Tuple, orig_dst: Optional[Tuple] = None
@@ -705,7 +732,7 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
     def log(
         self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
     ) -> None:
-        self.context.log("in", self.address, self.server, msg, additional)
+        self.context.log("in", self.address, self.server, level, msg, additional)
 
 
 class Bridge:
@@ -714,30 +741,49 @@ class Bridge:
         proto: Tuple[IncomingProtocol, Optional[OutgoingProtocol]],
         stream_id: Tuple[int, Optional[int]],
     ):
-        self._proto: Tuple[IncomingProtocol, Optional[OutgoingProtocol]]
+        self._proto: Tuple[IncomingProtocol, Optional[OutgoingProtocol]] = proto
         self._stream_id: Tuple[int, Optional[int]] = stream_id
         self._stream_ended: Tuple[asyncio.Event, asyncio.Event] = (
             asyncio.Event(),
             asyncio.Event(),
         )
-        self._sent_end_stream = Tuple[bool, bool] = (False, False)
+        self._sent_end_stream: Tuple[bool, bool] = (False, False)
         asyncio.ensure_future(self._internal_run())
 
     async def _internal_run(self) -> None:
-        # run the bridge and ensure the streams have been ended
         try:
-            await self.run()
-        finally:
-            for side in ProxySide:
-                if not self.is_connection_closed(side) and not self.has_sent_end_stream(
-                    side
-                ):
-                    # TODO: replace with sending RESET_STREAM once aioquic supports it
-                    proto = self.proto(side)
-                    proto._quic.send_stream_data(
-                        stream_id=self.stream_id(side), data=b"", end_stream=True
-                    )
-                    proto.transmit()
+            try:
+                # run the bridge and ensure the streams have been ended
+                try:
+                    await self.run()
+                finally:
+                    for side in ProxySide:
+                        if (
+                            (side is ProxySide.client or self.has_server_stream_id())
+                            and not self.is_connection_closed(side)
+                            and not self.has_sent_end_stream(side)
+                        ):
+                            # TODO: replace with sending RESET_STREAM once aioquic supports it
+                            proto = self.proto(side)
+                            proto._quic.send_stream_data(
+                                stream_id=self.stream_id(side),
+                                data=b"",
+                                end_stream=True,
+                            )
+                            proto.transmit()
+            except Exception as exc:
+                self.log(
+                    LogLevel.error,
+                    "Exception while running bridge.",
+                    {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "stacktrace": "\n" + traceback.format_exc(),
+                    },
+                )
+        except:
+            # when even logging fails
+            traceback.print_exc(file=sys.stderr)
 
     @property
     def client(self) -> IncomingProtocol:
@@ -813,7 +859,7 @@ class Bridge:
         self,
         side: ProxySide,
         cb: Callable[[ConnectionProtocol, int], None],
-        end_stream: bool,
+        end_stream: bool = False,
     ) -> None:
         # ensure the connection is open and no end_stream was sent
         if self.is_connection_closed(side):
@@ -987,14 +1033,16 @@ class HttpBridge(Bridge):
         stream_id: int,
         headers: Headers,
         push_id: Optional[int] = None,
-        push_promise_to: Optional[HttpBridge] = None
+        push_promise_to: Optional[HttpBridge] = None,
     ) -> None:
-        if push_id is None ^ push_promise_to is None:
-            raise ValueError("push_id and push_promise_to must either both be set or both be None")
-        
+        if (push_id is None) ^ (push_promise_to is None):
+            raise ValueError(
+                "push_id and push_promise_to must either both be set or both be None"
+            )
+
         super().__init__((client, server), (stream_id, None))
         self._flow: http.HTTPFlow = http.HTTPFlow(
-            self.client, self.server, True, self.context.mode.name
+            client, server, True, self.context.mode.name
         )
         self._is_push: bool = push_id is not None
         if self._is_push:
@@ -1015,7 +1063,31 @@ class HttpBridge(Bridge):
         self._data_frames.append((is_header, data, from_side))
         self._data_ready.set()
 
-    def _create_flow_request(self) -> None:
+    def _build_headers_from_flow_request(self) -> Headers:
+        headers: Headers = list()
+
+        def add_pseudo_header(
+            header: KnownPseudoHeaders, value: Optional[bytes]
+        ) -> None:
+            if value is not None:
+                headers.append((b":" + header.name.encode(), value))
+
+        # add all known pseudo headers
+        add_pseudo_header(KnownPseudoHeaders.method, self._flow.request.method)
+        add_pseudo_header(KnownPseudoHeaders.scheme, self._flow.request.scheme)
+        add_pseudo_header(KnownPseudoHeaders.authority, self._flow.request.host_header)
+        add_pseudo_header(KnownPseudoHeaders.path, self._flow.request.path)
+        if self._flow.request.metadata.get("websocket", False):
+            add_pseudo_header(KnownPseudoHeaders.protocol, b"websocket")
+
+        # add all but the host header
+        for header, value in self._flow.request.headers:
+            header = header.lower()
+            if header != b"host":
+                headers.append((header, value))
+        return headers
+
+    def _build_flow_request_from_headers(self) -> http.HTTPRequest:
         known_pseudo_headers: Dict[bytes, KnownPseudoHeaders] = {
             b":" + x.name.encode(): x for x in KnownPseudoHeaders
         }
@@ -1092,6 +1164,10 @@ class HttpBridge(Bridge):
                     raise ProtocolError(
                         "CONNECT method doesn't allow :scheme and :path headers."
                     )
+                if host_header is None:
+                    raise ProtocolError(
+                        "CONNECT method requires :authority or host header."
+                    )
                 scheme = None
                 path = None
                 first_line_format = "authority"
@@ -1125,9 +1201,21 @@ class HttpBridge(Bridge):
         if self.context.mode is ProxyMode.regular:
             # check if a target was given
             if host_header is None:
-                raise FlowError(
-                    400, "Request to regular proxy requires :authority or host header.",
-                )
+                # this is very likely to happen on pushes, correct for that
+                if self._is_push:
+                    host_header = self._push_bridge.request.host_header
+                    if host_header is None:
+                        raise FlowError(
+                            400,
+                            "Could not get host header for server push from original request.",
+                        )
+                    first_line_format = "absolute"
+                    headers.append((b"host", host_header))
+                else:
+                    raise FlowError(
+                        400,
+                        "Request to regular proxy requires :authority or host header.",
+                    )
             # check for userinfo https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.1.1
             parts = host_header.split(b"@")
             if (
@@ -1174,7 +1262,7 @@ class HttpBridge(Bridge):
         ):
             host, port = self.context.upstream_or_reverse_address
         elif self.context.mode is ProxyMode.transparent:
-            host, port = self.server
+            host, port = self.client.server
         else:
             raise NotImplementedError
 
@@ -1373,18 +1461,45 @@ class HttpBridge(Bridge):
     async def run(self) -> None:
         try:
             # parse the headers and allow patching
-            self._flow.request = self._create_flow_request()
+            self._flow.request = self._build_flow_request_from_headers()
             await self.context.ask("requestheaders", self._flow)
 
-            # CONNECT is only allowed for websockets
-            is_websocket: bool = self._flow.metadata["websocket"]
-            if self._flow.request.method == "CONNECT" and not is_websocket:
-                raise FlowError(501, "CONNECT for QUIC not implemented.")
+            # handle pushes differentyl
+            if self._is_push:
+                # send the push
+                Bridge.send(
+                    self._push_bridge,
+                    ProxySide.client,
+                    lambda proto, stream_id: proto._http.send_push_promise(
+                        stream_id=stream_id,
+                        headers=self._build_headers_from_flow_request(),
+                    ),
+                )
 
-            # 100-continue is allowed, but not on a push (and it's a bit weird for the server to assume that)
-            if self._flow.request.headers.get("expect", "").lower() == "100-continue" and not self._is_push:
-                self.send(self._origin, headers=[(b":status", b"100")])
-                self._flow.request.headers.pop("expect")
+            else:
+                # CONNECT is only allowed for websockets
+                is_websocket: bool = self._flow.metadata.get("websocket", False)
+                if self._flow.request.method == "CONNECT" and not is_websocket:
+                    raise FlowError(501, "CONNECT for QUIC not implemented.")
+
+                # there is nothing in the RFC against it, but that leaves us with trailers
+                if (
+                    self._flow.request.headers.get("expect", "").lower()
+                    == "100-continue"
+                ):
+                    self.send(self._origin, headers=[(b":status", b"100")])
+                    self._flow.request.headers.pop("expect")
+
+                # update host header in reverse proxy mode
+                if (
+                    self.context.mode is ProxyMode.reverse
+                    and not self.context.options.keep_host_header
+                ):
+                    self._flow.request.host_header = (
+                        self.context.upstream_or_reverse_address[0]
+                        + b":"
+                        + str(self.context.upstream_or_reverse_address[1]).encode()
+                    )
 
             # handle different content scenarios
             if is_websocket or self._flow.request.stream:
@@ -1394,20 +1509,22 @@ class HttpBridge(Bridge):
 
             # request is done, log it
             self._flow.request.timestamp_end = time.time()
-            self.log(LogLevel.debug, None, {"request": repr(self._flow.request), "push": self._is_push, "websocket": is_websocket, "origin": self._origin.name})
-
-            # update host header in reverse proxy mode
-            if (
-                self.context.mode is ProxyMode.reverse
-                and not self.context.options.keep_host_header
-            ):
-                self._flow.request.host_header = self.context.upstream_or_reverse_address
+            self.log(
+                LogLevel.debug,
+                None,
+                {
+                    "request": repr(self._flow.request),
+                    "push": self._is_push,
+                    "websocket": is_websocket,
+                    "origin": self._origin.name,
+                },
+            )
 
             # allow pre-recorded reponses
             await self.context.ask("request", self._flow)
             if is_websocket:
                 await self.context.ask("websocket_handshake", self._flow)
-    
+
         except FlowError as exc:
             self._handle_flow_error(exc)
             self._flow.error = baseflow.Error(exc.message)
@@ -1423,43 +1540,6 @@ class HttpBridge(Bridge):
         # set flag and allow patching
         self._flow.metadata["h2-pushed-stream"] = True
         await self.context.ask("requestheaders", self._flow)
-
-
-
-    async def run_request(self) -> None:
-  
-
-
-
-
-
-
-        await self.context.ask("request", self._flow)
-
-        if not self._flow.response:
-            server = (
-                await self._create_outgoing_protocol()
-                if self.context.mode is ProxyMode.regular
-                else self.proto_out
-            )
-            server.begin_http_request(self._flow)
-        else:
-            # response set by script
-            await self.context.ask("responseheaders", self._flow)
-
-        # response done
-        self.log("response", "debug", [repr(self._flow.response)])
-        await self.context.ask("response", self._flow)
-
-        if not self._flow.response.stream:
-            self.send(
-                self._flow,
-                headers=flow.response.headers,
-                data=flow.response.data.content,
-                end_flow=True,
-            )
-        else:
-            self.send_http(flow, headers=flow.response.headers, end_flow=False)
 
     async def run_websocket(self) -> None:
         # handle the websocket flow after negotiation
