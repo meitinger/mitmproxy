@@ -213,10 +213,10 @@ class ProxyContext:
         msg: str,
         additional: Optional[Dict[str, str]] = None,
     ) -> None:
+        msg = f"[QUIC-{type}] {from_addr[0]}:{from_addr[1]} -> {to_addr}: {msg}"
         if additional is not None:
             msg = ("\n" + " " * 6).join(
-                [f"[QUIC-{type}] {from_addr[0]}:{from_addr[1]} -> {to_addr}: {msg}"]
-                + [f"{name}: {value}" for (name, value) in additional.items()]
+                [msg] + [f"{name}: {value}" for (name, value) in additional.items()]
             )
         self.tell("log", log.LogEntry(msg, level.name))
 
@@ -708,11 +708,14 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         self, data: bytes, addr: Tuple, orig_dst: Optional[Tuple] = None
     ) -> None:
         if self.tls_established:
-            self._quic.receive_datagram(
-                cast(bytes, data), addr, self._loop.time(), orig_dst
-            )
-            self._process_events()
-            self.transmit()
+            try:
+                self._quic.receive_datagram(
+                    cast(bytes, data), addr, self._loop.time(), orig_dst
+                )
+                self._process_events()
+                self.transmit()
+            except:
+                traceback.print_exc(file=sys.stderr)
         else:
             # everything before the handshake must happen in a different thread
             # to support blocking for the client, since QuicConnection is not async
@@ -1108,14 +1111,6 @@ class HttpBridge(Bridge):
                 raise ProtocolError(f"Pseudo header :{header.name} is missing.")
             return value
 
-        # create the flow
-        flow = http.HTTPFlow(
-            self.client,
-            self.server if self.has_server() else None,
-            True,
-            self.context.mode.name,
-        )
-
         # filter out known headers (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.3)
         for header, value in self._headers:
             if self._is_pseudo_header(header):
@@ -1177,7 +1172,7 @@ class HttpBridge(Bridge):
                     raise ProtocolError(
                         f"Only 'websocket' is supported for :protocol header, got '{protocol.decode()}'."
                     )
-                flow.metadata["websocket"] = True
+                self._flow.metadata["websocket"] = True
                 scheme = require(KnownPseudoHeaders.scheme)
                 if scheme.lower() not in [b"http", b"https"]:
                     raise ProtocolError(
@@ -1284,13 +1279,18 @@ class HttpBridge(Bridge):
         )
 
     def _handle_flow_error(self, exc: FlowError) -> None:
+        # log the error
+        self.log(LogLevel.warn, exc.message)
+
         # try to send the status
-        if not self.is_connection_closed(ProxySide.client):
+        if not self.is_connection_closed(self._origin) and not self.has_sent_end_stream(
+            self._origin
+        ):
             try:
-                self.client._http.send_headers(
-                    self.stream_id(ProxySide.client),
-                    [
-                        (b":status", exc.status),
+                self.send(
+                    self._origin,
+                    headers=[
+                        (b":status", str(exc.status).encode()),
                         (b"server", SERVER_NAME.encode()),
                         (b"date", formatdate(time.time(), usegmt=True).encode()),
                     ],
