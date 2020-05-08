@@ -916,9 +916,9 @@ class Bridge:
     def send(
         self,
         side: ProxySide,
-        cb: Callable[[ConnectionProtocol, int], None],
+        cb: Callable[[ConnectionProtocol, int], Optional[int]],
         end_stream: bool = False,
-    ) -> None:
+    ) -> Optional[int]:
         # ensure sending data is possible
         proto = self.proto(side)
         if self._proto_closed[side]:
@@ -932,11 +932,12 @@ class Bridge:
             )
 
         # send and transmit
-        cb(proto, stream_id)
+        result = cb(proto, stream_id)
         if end_stream:
             proto._quic.send_stream_data(stream_id, b"", end_stream=True)
             self._end_stream_sent[side] = True
         proto.transmit()
+        return result
 
     @property
     def server(self) -> OutgoingProtocol:
@@ -1294,82 +1295,27 @@ class HttpBridge(Bridge):
                 )
             request.headers.add(header, value)
 
-    async def _read_request_data(self) -> bytes:
-        pass
-
-    async def fetch_response(
-        self, data_handler: Optional[Awaitable[None]]
-    ) -> http.HTTPResponse:
-        raise NotImplementedError
-
-    async def prepare_request(self) -> Optional[Awaitable[None]]:
-        return None
-
-    async def prepare_response(self, data_handler: Optional[Awaitable[None]]) -> None:
-        pass
-
     def provide_host_header(self) -> Optional[bytes]:
         return None
 
+    async def pump_data(
+        self, from_side: ProxySide, to_side: ProxySide, cb: Callable[[bytes], bytes]
+    ) -> None:
+        raise NotImplementedError
+
     async def read_data(
-        from_side: ProxySide, to_object: Union[http.HTTPRequest, http.HTTPResponse]
+        self,
+        from_side: ProxySide,
+        to_object: Union[http.HTTPRequest, http.HTTPResponse],
     ) -> None:
         pass
 
     async def run(self) -> None:
         try:
-            # parse the headers and allow patching
+            # parse the headers, allow patching and run http
             self._flow.request = self._build_flow_request()
             await self.context.ask("requestheaders", self._flow)
-
-            # handle different content scenarios
-            data_handler = await self.prepare_request()
-            if data_handler:
-                self._flow.request.data.content = b""
-            elif self._flow.request.stream:
-                self._flow.request.data.content = None
-            else:
-                await self.read_data(
-                    from_side=ProxySide.client, to_object=self._flow.request
-                )
-
-            self._flow.request.timestamp_end = time.time()
-            self.log(LogLevel.debug, repr(self._flow.request))
-
-            # allow pre-recorded reponses
-            await self.context.ask("request", self._flow)
-            await self.prepare_response(data_handler)
-
-            # query for a response if none was recorded
-            if not self._flow.response:
-                self._flow.response = await self.fetch_response(data_handler)
-            else:
-                await self.context.ask("responseheaders", self._flow)
-
-            # send the response
-            self.log(LogLevel.debug, [repr(self._flow.response)])
-            await self.channel.ask("response", self._flow)
-
-            if data_handler is not None:
-                self.send(ProxySide.client, headers=self._build_response_headers())
-                await data_handler()
-                self._flow.response.timestamp_end = time.time()
-            elif not self._flow.response.stream:
-                self.send(
-                    ProxySide.client,
-                    headers=self._build_response_headers(),
-                    data=response.data.content,
-                    end_stream=True,
-                )
-            else:
-                self.send(ProxySide.client, headers=self._build_response_headers())
-                await self._pump_data(
-                    from_side=ProxySide.server,
-                    to_side=ProxySide.client,
-                    cb=self._flow.response.stream,
-                )
-                self._flow.response.timestamp_end = time.time()
-
+            await self.run_http()
         except FlowError as exc:
             self._handle_flow_error(exc)
             self._flow.error = baseflow.Error(exc.message)
@@ -1381,6 +1327,9 @@ class HttpBridge(Bridge):
         finally:
             self._flow.live = False
 
+    async def run_http(self) -> None:
+        pass
+ 
     def send(
         self,
         to_side: ProxySide,
@@ -1408,19 +1357,19 @@ class PushBridge(HttpBridge):
         push_promise_to: HttpBridge,
     ) -> None:
         super().__init__(
-            client=client, server=server, stream_ids=(None, None), headers=headers
+            client=client,
+            server=server,
+            stream_ids=(None, None),
+            headers=headers,
         )
         self._flow.metadata["h2-pushed-stream"] = True
         self._push_id: int = push_id
         self._push_promise_to: HttpBridge = push_promise_to
 
-    async def fetch_response(self, data_handler: Optional[Awaitable[None]]) -> http.HTTPResonse:
-        return http.HTTPResponse()
-
     def provide_host_header(self) -> Optional[bytes]:
         return self._push_promise_to.request.host_header
 
-    async def prepare_request(self) -> bool:
+    async def run_http(self) -> None:
         # send the push
         Bridge.send(
             self._push_promise_to,
@@ -1429,6 +1378,19 @@ class PushBridge(HttpBridge):
                 stream_id=stream_id, headers=self._build_headers_from_flow_request(),
             ),
         )
+        # wait for the server socket
+
+        # either stream the data to the client or send it all in one
+        if self._flow.request.stream:
+            await self.pump_data(
+                from_side=ProxySide.server,
+                to_side=ProxySide.client,
+                cb=self._flow.request.stream,
+            )
+        else:
+            self.send(
+                ProxySide.client, data=self._flow.request.data.content, end_stream=True,
+            )
 
 
 class WebSocketBridge(HttpBridge):
@@ -1589,45 +1551,16 @@ class RequestBridge(WebSocketBridge):
         headers: Headers,
     ) -> None:
         super().__init__(
-            client=client, server=server, stream_ids=(stream_id, None), headers=headers
+            client=client,
+            server=server,
+            stream_ids=(stream_id, None),
+            headers=headers,
         )
 
     async def _build_flow_response(self) -> http.HTTPResponse:
         raise NotImplementedError
 
-    async def fetch_response(
-        self, data_handler: Optional[Awaitable[None]]
-    ) -> http.HTTPResponse:
-        # forward the request to the server
-        self.send(ProxySide.server, headers=self._build_request_headers())
-        if data_handler:
-            pass
-        elif self._flow.request.stream:
-            await self.pump_data(
-                from_side=ProxySide.client,
-                to_side=ProxySide.server,
-                cb=self._flow.request.stream,
-            )
-        else:
-            self.send(
-                ProxySide.server, data=self._flow.request.data.content, end_stream=True
-            )
-
-        # wait for the response headers and allow alternation
-        self._flow.response = await self._build_flow_response()
-        await self.context.ask("responseheaders", self._flow)
-
-        if data_handler:
-            pass
-        elif self._flow.response.stream:
-            self._flow.response.data.content = None
-        else:
-            await self.read_data(
-                from_side=ProxySide.server, to_object=self._flow.response
-            )
-            self._flow.response.timestamp_end = time.time()
-
-    async def prepare_request(self) -> Optional[Awaitable[None]]:
+    async def run_http(self) -> None:
         # CONNECT is only allowed for websockets
         is_websocket: bool = self._flow.metadata.get("websocket", False)
         if self._flow.request.method == "CONNECT" and not is_websocket:
@@ -1649,12 +1582,88 @@ class RequestBridge(WebSocketBridge):
                 + str(self.context.upstream_or_reverse_address[1]).encode()
             )
 
-        # handle data with websockets
-        return self.run_websocket if is_websocket else None
+        # handle different content scenarios
+        if is_websocket:
+            self._flow.request.data.content = b""
+        elif self._flow.request.stream:
+            self._flow.request.data.content = None
+        else:
+            await self.read_data(
+                from_side=ProxySide.client, to_object=self._flow.request
+            )
 
-    async def prepare_response(self, data_handler: Optional[Awaitable[None]]) -> None:
-        if data_handler is not None:
+        # NOTE: when the request is streamed, this end timestamp is too early
+        self._flow.request.timestamp_end = time.time()
+        self.log(LogLevel.debug, repr(self._flow.request))
+
+        # allow pre-recorded responses
+        await self.context.ask("request", self._flow)
+        if is_websocket is not None:
             await self.context.ask("websocket_handshake", self._flow)
+
+        # query for a response if none was recorded
+        is_live_response = not self._flow.response
+        if is_live_response:
+            # forward the request to the server
+            self.send(ProxySide.server, headers=self._build_request_headers())
+            if is_websocket:
+                pass
+            elif self._flow.request.stream:
+                await self.pump_data(
+                    from_side=ProxySide.client,
+                    to_side=ProxySide.server,
+                    cb=self._flow.request.stream,
+                )
+            else:
+                self.send(
+                    ProxySide.server, data=self._flow.request.data.content, end_stream=True
+                )
+
+            # wait for the response headers and allow alternations
+            self._flow.response = await self._build_flow_response()
+            await self.context.ask("responseheaders", self._flow)
+
+            if is_websocket:
+                pass
+            elif self._flow.response.stream:
+                self._flow.response.data.content = None
+            else:
+                await self.read_data(
+                    from_side=ProxySide.server, to_object=self._flow.response
+                )
+                self._flow.response.timestamp_end = time.time()
+
+        else:
+            await self.context.ask("responseheaders", self._flow)
+            self._flow.response.timestamp_end = time.time()
+
+        # send the response
+        self.log(LogLevel.debug, [repr(self._flow.response)])
+        await self.context.ask("response", self._flow)
+
+        if is_websocket is not None:
+            self.send(ProxySide.client, headers=self._build_response_headers())
+            await self.run_websocket()
+            self._flow.response.timestamp_end = time.time()
+        elif not self._flow.response.stream or not is_live_response:
+            data = self._flow.response.data.content
+            if callable(self._flow.stream):
+                pass # await executor
+
+            self.send(
+                ProxySide.client,
+                headers=self._build_response_headers(),
+                data=data,
+                end_stream=True,
+            )
+        else:
+            self.send(ProxySide.client, headers=self._build_response_headers())
+            await self.pump_data(
+                from_side=ProxySide.server,
+                to_side=ProxySide.client,
+                cb=self._flow.response.stream,
+            )
+            self._flow.response.timestamp_end = time.time()
 
 
 class SessionTicketStore:
