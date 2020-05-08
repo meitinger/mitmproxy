@@ -5,7 +5,7 @@ import { formatSize, formatTimeDelta } from '../../utils.js'
 
 export function TLSColumn({ flow }) {
     return (
-        <td className={classnames('col-tls', flow.request.scheme === 'https' ? 'col-tls-https' : 'col-tls-http')}></td>
+        <td className={classnames('col-tls', flow.type !== 'http' ? '' : flow.request.scheme === 'https' ? 'col-tls-https' : 'col-tls-http')}></td>
     )
 }
 
@@ -65,14 +65,14 @@ export function PathColumn({ flow }) {
     }
     return (
         <td className="col-path">
-            {flow.request.is_replay && (
+            {flow.type === "http" && flow.request.is_replay && (
                 <i className="fa fa-fw fa-repeat pull-right"></i>
             )}
             {flow.intercepted && (
                 <i className="fa fa-fw fa-pause pull-right"></i>
             )}
             {err}
-            {RequestUtils.pretty_url(flow.request)}
+            {flow.type !== "http" ? "" : RequestUtils.pretty_url(flow.request)}
         </td>
     )
 }
@@ -82,7 +82,7 @@ PathColumn.headerName = 'Path'
 
 export function MethodColumn({ flow }) {
     return (
-        <td className="col-method">{flow.request.method}</td>
+        <td className="col-method">{flow.type === "http" ? flow.request.method : flow.type}</td>
     )
 }
 
@@ -123,6 +123,9 @@ export function SizeColumn({ flow }) {
 }
 
 SizeColumn.getTotalSize = flow => {
+    if (flow.type !== "http") {
+        return 0
+    }
     let total = flow.request.contentLength
     if (flow.response) {
         total += flow.response.contentLength || 0

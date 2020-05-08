@@ -57,6 +57,10 @@ export function CertificateInfo({ flow }) {
 }
 
 export function Timing({ flow }) {
+    if (flow.type !== "http") {
+        return null
+    }
+
     const { server_conn: sc, client_conn: cc, request: req, response: res } = flow
 
     const timestamps = [
