@@ -67,7 +67,12 @@ from aioquic.h3.events import (
     PushPromiseReceived,
 )
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.connection import QuicConnection, QuicConnectionError
+from aioquic.quic.connection import (
+    QuicConnection,
+    QuicConnectionError,
+    stream_is_client_initiated,
+    stream_is_unidirectional,
+)
 from aioquic.quic.events import (
     ConnectionTerminated,
     HandshakeCompleted,
@@ -429,7 +434,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 )
                 return
             bridge.set_stream_id(self._side, event.stream_id)
-            self._bridges[event.stream_id] = bridge  # necessary for stream reset
+            self._bridges[event.stream_id] = bridge  # necessary for stream end/reset
         bridge.post_data(
             ProxySide.server,
             event.data if is_data else event.headers,
@@ -851,16 +856,6 @@ class Bridge:
         self._event: asyncio.Event = asyncio.Event()
         asyncio.ensure_future(self._internal_run())
 
-    def _has_open_stream_and_not(self, condition: List[bool]) -> bool:
-        return tuple(
-            [
-                proto.connected() and stream_id is not None and not cond
-                for (proto, stream_id, cond) in zip(
-                    self._proto, self._stream_id, condition
-                )
-            ]
-        )
-
     async def _internal_run(self) -> None:
         try:
             try:
@@ -873,7 +868,9 @@ class Bridge:
                         try:
                             proto = self._proto[side]
                             proto._quic.send_stream_data(
-                                stream_id=self._stream_id[side], data=b"", end_stream=True,
+                                stream_id=self._stream_id[side],
+                                data=b"",
+                                end_stream=True,
                             )
                             proto.transmit()
                         except:
@@ -884,15 +881,42 @@ class Bridge:
         except:
             handle_except(self)
 
+    def _is_stream_writeable(self, stream_id: int, side: ProxySide) -> bool:
+        # from QUIC protocol perspective, the server side acts like the client
+        return stream_is_client_initiated(
+            stream_id
+        ) == side is ProxySide.server or not stream_is_unidirectional(stream_id)
+
     @property
     def can_receive(self) -> Tuple[bool, bool]:
         # used by bridges
-        return self._has_open_stream_and_not(self._stream_ended_received)
+        return tuple(
+            [
+                proto is not None
+                and proto.connected()
+                and stream_id is not None
+                and not stream_ended
+                for (proto, stream_id, stream_ended) in zip(
+                    self._proto, self._stream_id, self._stream_ended_received
+                )
+            ]
+        )
 
     @property
     def can_send(self) -> Tuple[bool, bool]:
         # used by bridges, same checks as in send method
-        return self._has_open_stream_and_not(self._end_stream_sent)
+        return tuple(
+            [
+                proto is not None
+                and proto.connected()
+                and stream_id is not None
+                and self._is_stream_writeable(stream_id, side)
+                and not end_stream
+                for (proto, stream_id, side, end_stream) in zip(
+                    self._proto, self._stream_id, ProxySide, self._end_stream_sent
+                )
+            ]
+        )
 
     @property
     def client(self) -> IncomingProtocol:
@@ -919,13 +943,22 @@ class Bridge:
     def log(
         self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
     ) -> None:
+        description = {
+            "is_push": isinstance(self, PushBridge),
+            "has_server": self.has_server,
+            "stream_id": self._stream_id,
+            "stream_ended_received": self._stream_ended_received,
+            "end_stream_sent": self._end_stream_sent,
+        }
+        if additional is not None:
+            description.update(additional)
         self.context.log(
             "bridge",
             self.client.address,
             self.server.address if self.has_server else self.client.server,
             level,
             msg,
-            additional,
+            description,
         )
 
     def notify(self) -> None:
@@ -957,6 +990,11 @@ class Bridge:
                 500, f"Connection to {to_side.name} has already been closed.",
             )
         stream_id = self.stream_id(to_side)
+        if not self._is_stream_writeable(stream_id, to_side):
+            raise FlowError(
+                500,
+                f"Cannot send data on a {to_side.name}-initiated unidirectional stream.",
+            )
         if self._end_stream_sent[to_side]:
             raise FlowError(
                 500, f"Stream to {to_side.name} has already been ended by proxy.",
@@ -1245,7 +1283,11 @@ class HttpBridge(Bridge):
 
     def _handle_flow_error(self, exc: FlowError) -> None:
         # log the error
-        self.log(LogLevel.warn, exc.message)
+        self.log(
+            LogLevel.warn,
+            exc.message,
+            {"stacktrace": "\n" + traceback.format_exc()},
+        )
 
         # try to send the status
         if self.can_send[ProxySide.client]:
@@ -1265,7 +1307,14 @@ class HttpBridge(Bridge):
                 self.client.transmit()
 
     def _handle_protocol_error(self, exc: ProtocolError) -> None:
-        # close the connection (will be logged when ConnectionTerminated is handled)
+        # log the error
+        self.log(
+            LogLevel.warn,
+            exc.reason_phrase,
+            {"stacktrace": "\n" + traceback.format_exc()},
+        )
+
+        # close the connection
         self.client.close(error_code=exc.error_code, reason_phrase=exc.reason_phrase)
 
     async def _receive_iterator(
@@ -1372,7 +1421,7 @@ class HttpBridge(Bridge):
         to_object.data.content = b""
         async for data in self._receive_iterator(
             from_side=from_side,
-            headers_cb=lambda headers: to_object.headers.extend(headers),
+            headers_cb=lambda headers: to_object.headers.update(headers),
         ):
             to_object.data.content += data
 
@@ -1473,6 +1522,7 @@ class PushBridge(HttpBridge):
         # end the request
         self._flow.request.content = None if self._flow.request.stream else b""
         self._flow.request.timestamp_end = time.time()
+        self.log(LogLevel.debug, repr(self._flow.request))
 
         # allow mitmproxy to provide a different push (as response)
         await self.context.ask("request", self._flow)
@@ -1654,7 +1704,10 @@ class WebSocketBridge(HttpBridge):
                         self.log(
                             LogLevel.debug,
                             "Unknown websocket event received.",
-                            {"type": type(event).__name__, "from": from_side.name},
+                            {
+                                "ws_event_type": type(event).__name__,
+                                "ws_event_from": from_side.name,
+                            },
                         )
         return True
 
