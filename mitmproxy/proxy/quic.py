@@ -90,12 +90,19 @@ HttpConnection = Union[H0Connection, H3Connection]
 SERVER_NAME = "mitmproxy/" + VERSION
 
 
-class KnownPseudoHeaders(enum.Enum):
+class RequestPseudoHeaders(enum.Enum):
     method = 1
     scheme = 2
     authority = 3
     path = 4
     protocol = 5
+
+
+class ResponsePseudoHeaders(enum.Enum):
+    status = 1
+
+
+PseudoHeaders = Union[RequestPseudoHeaders, ResponsePseudoHeaders]
 
 
 class LogLevel(enum.Enum):
@@ -324,20 +331,34 @@ class ConnectionProtocol(QuicConnectionProtocol):
 
     def _handle_http_data_received(self, event: DataReceived) -> None:
         event_description = {
+            "data_length": len(event.data),
             "stream_id": event.stream_id,
             "stream_ended": event.stream_ended,
-            "data_length": len(event.data),
         }
         if event.stream_id not in self._bridges:
             self.log(
-                LogLevel.warn, "Data received without prior headers.", event_description
+                LogLevel.warn, "Data received on unknown stream.", event_description
             )
             return
         bridge = self._bridges[event.stream_id]
         bridge.post_data(self._side, event.data)
 
     def _handle_http_headers_received(self, event: HeadersReceived) -> None:
+        event_description = {
+            "header_length": len(event.headers),
+            "stream_id": event.stream_id,
+            "stream_ended": event.stream_ended,
+        }
         if event.stream_id not in self._bridges:
+            # only the client can initiate a new stream
+            if self._side is ProxySide.server:
+                self.log(
+                    LogLevel.warn,
+                    "Received headers for unknown stream.",
+                    event_description,
+                )
+                return
+
             self._bridges[event.stream_id] = RequestBridge(
                 client=self._client,
                 server=self._server,
@@ -353,12 +374,12 @@ class ConnectionProtocol(QuicConnectionProtocol):
             if event.push_id is None:
                 self._handle_http_headers_received(event)
             else:
-                self._handle_http_push_data_or_trailers_received(event, is_data=True)
+                self._handle_http_push_data_or_trailers_received(event, is_data=False)
         elif isinstance(event, DataReceived):
             if event.push_id is None:
                 self._handle_http_data_received(event)
             else:
-                self._handle_http_push_data_or_trailers_received(event, is_data=False)
+                self._handle_http_push_data_or_trailers_received(event, is_data=True)
         elif isinstance(event, PushPromiseReceived):
             self._handle_http_push_promise_received(event)
         else:
@@ -375,7 +396,7 @@ class ConnectionProtocol(QuicConnectionProtocol):
             "type": "data" if is_data else "trailers",
             "stream_id": event.stream_id,
             "stream_ended": event.stream_ended,
-            "push_id": event.push.id,
+            "push_id": event.push_id,
         }
         if self._side is ProxySide.client:
             self.log(
@@ -417,8 +438,9 @@ class ConnectionProtocol(QuicConnectionProtocol):
 
     def _handle_http_push_promise_received(self, event: PushPromiseReceived) -> None:
         event_description = {
+            "headers_length": len(event.headers),
+            "push_id": event.push_id,
             "stream_id": event.stream_id,
-            "push_id": event.push.id,
         }
         if self._side is ProxySide.client:
             # log and exit
@@ -584,14 +606,20 @@ class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
         ConnectionProtocol.__init__(self, client, self, *args, **kwargs)
         connections.ServerConnection.__init__(self, None, None, None)
 
-    @property
-    def source_address(self) -> Tuple[str, int]:
-        return self._transport.get_extra_info("sockname")[0:2]
+    def create_stream_id(self, bridge: Bridge) -> int:
+        assert bridge is not None
+        stream_id = self._quic.get_next_available_stream_id()
+        self._bridges[stream_id] = bridge
+        bridge.set_stream_id(self._side, stream_id)
+        return stream_id
 
-    @source_address.setter
-    def source_address(self, source_address):
-        if source_address is not None:
-            raise PermissionError
+    def datagram_received(
+        self, data: bytes, addr: Tuple, orig_dst: Optional[Tuple] = None
+    ) -> None:
+        try:
+            super().datagram_received(data, addr, orig_dst)
+        except:
+            handle_except(self)
 
     def log(
         self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
@@ -607,13 +635,14 @@ class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
             self.context.convert_certificate(cert) for cert in event.certificates[1:]
         ]
 
-    def datagram_received(
-        self, data: bytes, addr: Tuple, orig_dst: Optional[Tuple] = None
-    ) -> None:
-        try:
-            super().datagram_received(data, addr, orig_dst)
-        except:
-            handle_except(self)
+    @property
+    def source_address(self) -> Tuple[str, int]:
+        return self._transport.get_extra_info("sockname")[0:2]
+
+    @source_address.setter
+    def source_address(self, source_address):
+        if source_address is not None:
+            raise PermissionError
 
 
 class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
@@ -630,27 +659,6 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
                 self._quic.tls.client_hello_cb = self._handle_client_hello
 
         self._quic._initialize = initialize_replacement
-
-    @property
-    def context(self) -> ProxyContext:
-        return self._context
-
-    @property
-    def server(self) -> Tuple[str, int]:
-        orig_dst = self._quic._network_paths[0].orig_dst
-        if orig_dst is None:
-            orig_dst = self._transport.get_extra_info("sockname")
-        if orig_dst[0] == "::":
-            return ("::1", orig_dst[1])
-        elif orig_dst[0] == "0.0.0.0":
-            return ("127.0.0.1", orig_dst[1])
-        else:
-            return orig_dst[0:2]
-
-    @server.setter
-    def server(self, server):
-        if server is not None:
-            raise PermissionError
 
     def _handle_client_hello(self, hello: ClientHello) -> None:
         tls: TlsContext = self._quic.tls
@@ -735,6 +743,10 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         except:
             handle_except(self)
 
+    @property
+    def context(self) -> ProxyContext:
+        return self._context
+
     async def create_outgoing_protocol(
         self,
         *,
@@ -799,6 +811,23 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
     ) -> None:
         self.context.log("in", self.address, self.server, level, msg, additional)
 
+    @property
+    def server(self) -> Tuple[str, int]:
+        orig_dst = self._quic._network_paths[0].orig_dst
+        if orig_dst is None:
+            orig_dst = self._transport.get_extra_info("sockname")
+        if orig_dst[0] == "::":
+            return ("::1", orig_dst[1])
+        elif orig_dst[0] == "0.0.0.0":
+            return ("127.0.0.1", orig_dst[1])
+        else:
+            return orig_dst[0:2]
+
+    @server.setter
+    def server(self, server):
+        if server is not None:
+            raise PermissionError
+
 
 class Bridge:
     def __init__(
@@ -815,28 +844,12 @@ class Bridge:
             ]
         )
         self._proto: List[Optional[ConnectionProtocol]] = list(protos)
+        self._close_server = False
         self._stream_id: List[Optional[int]] = list(stream_ids)
         self._stream_ended_received: List[bool] = [False, False]
         self._end_stream_sent: List[bool] = [False, False]
         self._event: asyncio.Event = asyncio.Event()
         asyncio.ensure_future(self._internal_run())
-
-    async def _internal_run(self) -> None:
-        try:
-            # run the bridge and ensure the streams have been ended
-            try:
-                await self.run()
-            finally:
-                for side in ProxySide:
-                    if self.can_send[side]:
-                        # TODO: replace with sending RESET_STREAM once aioquic supports it
-                        proto = self._proto[side]
-                        proto._quic.send_stream_data(
-                            stream_id=self._stream_id[side], data=b"", end_stream=True,
-                        )
-                        proto.transmit()
-        except:
-            handle_except(self)
 
     def _has_open_stream_and_not(self, condition: List[bool]) -> bool:
         return tuple(
@@ -847,6 +860,29 @@ class Bridge:
                 )
             ]
         )
+
+    async def _internal_run(self) -> None:
+        try:
+            try:
+                await self.run()
+            finally:
+                # ensure the streams have been ended
+                for side in ProxySide:
+                    if self.can_send[side]:
+                        # TODO: replace with sending RESET_STREAM once aioquic supports it
+                        try:
+                            proto = self._proto[side]
+                            proto._quic.send_stream_data(
+                                stream_id=self._stream_id[side], data=b"", end_stream=True,
+                            )
+                            proto.transmit()
+                        except:
+                            handle_except(self)
+                # close the server if it has been created
+                if self._close_server:
+                    self.server.close()
+        except:
+            handle_except(self)
 
     @property
     def can_receive(self) -> Tuple[bool, bool]:
@@ -937,6 +973,13 @@ class Bridge:
     @property
     def server(self) -> OutgoingProtocol:
         return cast(OutgoingProtocol, self.proto(ProxySide.server))
+
+    @server.setter
+    def server(self, server: OutgoingProtocol) -> None:
+        assert server is not None
+        assert not self.has_server
+        self._proto[ProxySide.server] = server
+        self._close_server = True
 
     def set_stream_id(self, side: ProxySide, stream_id: int) -> None:
         # called from ConnectionProtocol for pushes and regular proxy bridges
@@ -1033,18 +1076,7 @@ class HttpBridge(Bridge):
             Deque[Tuple[True, bytes]], Deque[Tuple[True, bytes]]
         ] = (collections.deque(), collections.deque())
 
-    def post_data(
-        self, from_side: ProxySide, data: bytes, *, is_header: bool = False
-    ) -> None:
-        self._data_frames[from_side].append((is_header, data))
-        self.notify()
-
     def _build_flow_request(self) -> http.HTTPRequest:
-        known_pseudo_headers: Dict[bytes, KnownPseudoHeaders] = {
-            b":" + x.name.encode(): x for x in KnownPseudoHeaders
-        }
-        pseudo_headers: Dict[KnownPseudoHeaders, bytes] = {}
-        headers: List[Tuple[bytes, bytes]] = []
         host_header: bytes = None
         first_line_format: str
         method: bytes
@@ -1053,36 +1085,26 @@ class HttpBridge(Bridge):
         port: int
         path: bytes
 
+        # initialize pseudo headers and ordinary ones
+        pseudo_headers, headers = self.parse_headers(
+            self._headers, RequestPseudoHeaders
+        )
+        for header, value in headers:
+            if header == b"host":
+                if host_header is not None:
+                    raise ProtocolError("Host header must occur only once.")
+                host_header = value
+
         # helper function
-        def require(header: KnownPseudoHeaders) -> bytes:
+        def require(header: RequestPseudoHeaders) -> bytes:
             value = pseudo_headers.get(header)
             if value is None:
                 raise ProtocolError(f"Pseudo header :{header.name} is missing.")
             return value
 
-        # filter out known headers (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.3)
-        for header, value in self._headers:
-            if self.is_pseudo_header(header):
-                pseudo_header = known_pseudo_headers.get(header)
-                if pseudo_header is None:
-                    raise ProtocolError(
-                        f"Pseudo header '{header.decode()}' is unknown."
-                    )
-                if pseudo_header in pseudo_headers:
-                    raise ProtocolError(
-                        f"Pseudo header :{pseudo_header.name} must occur only once."
-                    )
-                pseudo_headers[pseudo_header] = value
-            else:
-                if header == b"host":
-                    if host_header is not None:
-                        raise ProtocolError("Host header must occur only once.")
-                    host_header = value
-                headers.append((header, value))
-
         # clients could use host instead of :authority (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.1.1)
-        if KnownPseudoHeaders.authority in pseudo_headers:
-            authority = pseudo_headers[KnownPseudoHeaders.authority]
+        if RequestPseudoHeaders.authority in pseudo_headers:
+            authority = pseudo_headers[RequestPseudoHeaders.authority]
             if host_header is not None:
                 if host_header != authority:
                     raise ProtocolError(
@@ -1102,14 +1124,14 @@ class HttpBridge(Bridge):
                 headers.append((b"host", host_header))
 
         # get scheme, path and first_line_format, handle CONNECT requests differently
-        method = require(KnownPseudoHeaders.method)
+        method = require(RequestPseudoHeaders.method)
         if method.upper() == b"CONNECT":
-            protocol = pseudo_headers.get(KnownPseudoHeaders.protocol)
+            protocol = pseudo_headers.get(RequestPseudoHeaders.protocol)
             if protocol is None:
                 # ordinary CONNECT (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.2 -> https://tools.ietf.org/html/rfc7540#section-8.3)
                 if (
-                    KnownPseudoHeaders.scheme in pseudo_headers
-                    or KnownPseudoHeaders.path in pseudo_headers
+                    RequestPseudoHeaders.scheme in pseudo_headers
+                    or RequestPseudoHeaders.path in pseudo_headers
                 ):
                     raise ProtocolError(
                         "CONNECT method doesn't allow :scheme and :path headers."
@@ -1128,17 +1150,17 @@ class HttpBridge(Bridge):
                         f"Only 'websocket' is supported for :protocol header, got '{protocol.decode()}'."
                     )
                 self._flow.metadata["websocket"] = True
-                scheme = require(KnownPseudoHeaders.scheme)
+                scheme = require(RequestPseudoHeaders.scheme)
                 if scheme.lower() not in [b"http", b"https"]:
                     raise ProtocolError(
                         f"Only 'http' and 'https' are supported for :scheme during a websocket CONNECT, got '{scheme.decode()}'."
                     )
-                path = require(KnownPseudoHeaders.path)
+                path = require(RequestPseudoHeaders.path)
                 first_line_format = "absolute"
         else:
             # ordinary request (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.1.1)
-            scheme = require(KnownPseudoHeaders.scheme)
-            path = require(KnownPseudoHeaders.path)
+            scheme = require(RequestPseudoHeaders.scheme)
+            path = require(RequestPseudoHeaders.path)
             first_line_format = "relative" if host_header is None else "absolute"
 
         # check any given path (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.1.1)
@@ -1246,7 +1268,7 @@ class HttpBridge(Bridge):
         # close the connection (will be logged when ConnectionTerminated is handled)
         self.client.close(error_code=exc.error_code, reason_phrase=exc.reason_phrase)
 
-    async def _read_data_iterator(
+    async def _receive_iterator(
         self, *, from_side: ProxySide, headers_cb: Callable[[Headers], None]
     ) -> AsyncIterable[bytes]:
         # read all data in chunks allowing special handling of headers
@@ -1260,26 +1282,30 @@ class HttpBridge(Bridge):
                     yield data
             if not self.can_receive[from_side]:
                 break
-            await self.notify()
+            await self.wait()
 
     def build_request_headers(self) -> Headers:
         headers: Headers = list()
 
         def add_pseudo_header(
-            header: KnownPseudoHeaders, value: Optional[bytes]
+            header: RequestPseudoHeaders, value: Optional[bytes]
         ) -> None:
             if value is not None:
                 headers.append((b":" + header.name.encode(), value))
 
         # add all known pseudo headers
-        add_pseudo_header(KnownPseudoHeaders.method, self._flow.request.method.encode())
-        add_pseudo_header(KnownPseudoHeaders.scheme, self._flow.request.scheme.encode())
         add_pseudo_header(
-            KnownPseudoHeaders.authority, self._flow.request.host_header.encode()
+            RequestPseudoHeaders.method, self._flow.request.method.encode()
         )
-        add_pseudo_header(KnownPseudoHeaders.path, self._flow.request.path.encode())
+        add_pseudo_header(
+            RequestPseudoHeaders.scheme, self._flow.request.scheme.encode()
+        )
+        add_pseudo_header(
+            RequestPseudoHeaders.authority, self._flow.request.host_header.encode()
+        )
+        add_pseudo_header(RequestPseudoHeaders.path, self._flow.request.path.encode())
         if self._flow.metadata.get("websocket", False):
-            add_pseudo_header(KnownPseudoHeaders.protocol, b"websocket")
+            add_pseudo_header(RequestPseudoHeaders.protocol, b"websocket")
 
         # add all but the host header
         for header, value in self._flow.request.headers.fields:
@@ -1291,40 +1317,52 @@ class HttpBridge(Bridge):
     def build_response_headers(self) -> Headers:
         # translate the status and append the other headers
         headers: Headers = list()
-        headers.append(b":status", str(self._flow.response.status_code).encode())
-        for header, value in self._flow.request.headers:
+        headers.append((b":status", str(self._flow.response.status_code).encode()))
+        for header, value in self._flow.response.headers.fields:
             headers.append((header.lower(), value))
 
-    def is_pseudo_header(self, header: Optional[bytes]) -> bool:
-        if header is None:
-            raise ProtocolError("Empty header name is not allowed.")
-        if header != header.lower():
-            raise ProtocolError(
-                f"Uppercase header name '{header.decode()}' is not allowed."
-            )
-        return header.startswith(b":")
-        
+    def parse_headers(
+        self, headers: Headers, pseudo_header_type: Type
+    ) -> Tuple[Dict[PseudoHeaders, bytes], List[Tuple[bytes, bytes]]]:
+        known_pseudo_headers: Dict[bytes, PseudoHeaders] = {
+            b":" + x.name.encode(): x for x in pseudo_header_type
+        }
+        pseudo_headers: Dict[PseudoHeaders, bytes] = {}
+        other_headers: List[Tuple[bytes, bytes]] = []
+
+        # filter out known headers (https://tools.ietf.org/html/draft-ietf-quic-http-27#section-4.1.3)
+        for header, value in headers:
+            if header is None:
+                raise ProtocolError("Empty header name is not allowed.")
+            if header != header.lower():
+                raise ProtocolError(
+                    f"Uppercase header name '{header.decode()}' is not allowed."
+                )
+            if header.startswith(b":"):
+                pseudo_header = known_pseudo_headers.get(header)
+                if pseudo_header is None:
+                    raise ProtocolError(
+                        f"Pseudo header '{header.decode()}' is unknown."
+                    )
+                if pseudo_header in pseudo_headers:
+                    raise ProtocolError(
+                        f"Pseudo header :{pseudo_header.name} must occur only once."
+                    )
+                pseudo_headers[pseudo_header] = value
+            else:
+                other_headers.append((header, value))
+        return (pseudo_headers, other_headers)
+
+    def post_data(
+        self, from_side: ProxySide, data: bytes, *, is_header: bool = False
+    ) -> None:
+        self._data_frames[from_side].append((is_header, data))
+        self.notify()
+
     def provide_host_header(self) -> Optional[bytes]:
         return None
 
-    async def pump_data(
-        self,
-        *,
-        from_side: ProxySide,
-        to_side: ProxySide,
-        cb: Optional[Callable[[AsyncIterable[bytes]], AsyncIterable[bytes]]],
-    ) -> None:
-        # pump data through the callable, sending it and trailers to the other side
-        iterator = self._read_data_iterator(
-            from_side=from_side,
-            headers_cb=lambda headers: self.send(to_side=to_side, headers=headers),
-        )
-        if callable(cb):
-            iterator = cb(iterator)
-        async for data in iterator:
-            self.send(to_side=to_side, data=data)
-
-    async def read_data(
+    async def receive_data_and_trailers(
         self,
         *,
         from_side: ProxySide,
@@ -1332,7 +1370,7 @@ class HttpBridge(Bridge):
     ) -> None:
         # store all data and trailers in the object
         to_object.data.content = b""
-        async for data in self._read_data_iterator(
+        async for data in self._receive_iterator(
             from_side=from_side,
             headers_cb=lambda headers: to_object.headers.extend(headers),
         ):
@@ -1376,6 +1414,23 @@ class HttpBridge(Bridge):
                 proto._http.send_headers(stream_id, trailers)
 
         super().send(to_side=to_side, cb=internal_send, end_stream=end_stream)
+
+    async def stream_data_and_forward_trailers(
+        self,
+        *,
+        from_side: ProxySide,
+        to_side: ProxySide,
+        cb: Optional[Callable[[AsyncIterable[bytes]], AsyncIterable[bytes]]],
+    ) -> None:
+        # pump data through the callable, sending it and trailers to the other side
+        iterator = self._receive_iterator(
+            from_side=from_side,
+            headers_cb=lambda headers: self.send(to_side=to_side, trailers=headers),
+        )
+        if callable(cb):
+            iterator = cb(iterator)
+        async for data in iterator:
+            self.send(to_side=to_side, data=data)
 
 
 class PushBridge(HttpBridge):
@@ -1443,7 +1498,7 @@ class PushBridge(HttpBridge):
             if self._flow.response.stream:
                 self._flow.response.data.content = None
             else:
-                await self.read_data(
+                await self.receive_data_and_trailers(
                     from_side=ProxySide.server, to_object=self._flow.response
                 )
         else:
@@ -1462,7 +1517,7 @@ class PushBridge(HttpBridge):
 
         # stream or send the data
         if self._flow.response.stream:
-            await self.pump_data(
+            await self.stream_data_and_forward_trailers(
                 from_side=ProxySide.server,
                 to_side=ProxySide.client,
                 cb=self._flow.response.stream,
@@ -1644,19 +1699,15 @@ class RequestBridge(WebSocketBridge):
             client=client, server=server, stream_ids=(stream_id, None), headers=headers,
         )
 
-    async def _build_flow_response(self, headers: Headers) -> http.HTTPResponse:
-        status: Optional[Tuple[bytes, bytes]] = None
-        for header, value  in headers:
-            if self.is_pseudo_header(header):
-                
-        is_pseudo_header
-        if status is None:
-            raise FlowError(502, "Status code not received.")
-        headers.remove(status)
+    def _build_flow_response(self, headers: Headers) -> http.HTTPResponse:
+        pseudo_headers, headers = self.parse_headers(headers, ResponsePseudoHeaders)
+        status_code = pseudo_headers.get(ResponsePseudoHeaders.status)
+        if status_code is None:
+            raise ProtocolError(f"Pseudo header :status is missing.")
         return http.HTTPResponse(
             http_version=self._flow.request.http_version,
-            status_code=int(status[1].decode()),
-            reason=None,
+            status_code=int(status_code.decode()),
+            reason=b"",
             headers=headers,
             content=None,
             timestamp_start=time.time(),
@@ -1670,7 +1721,9 @@ class RequestBridge(WebSocketBridge):
             if queue:
                 is_header, headers = queue.popleft()
                 if not is_header:
-                    raise FlowError(502, "Received data before any headers from server.")
+                    raise FlowError(
+                        502, "Received data before any headers from server."
+                    )
                 return headers
             if not self.can_receive[ProxySide.server]:
                 raise FlowError(502, "Server connection closed before any headers.")
@@ -1697,7 +1750,7 @@ class RequestBridge(WebSocketBridge):
         if is_websocket or self._flow.request.stream:
             self._flow.request.data.content = None
         else:
-            await self.read_data(
+            await self.receive_data_and_trailers(
                 from_side=ProxySide.client, to_object=self._flow.request
             )
 
@@ -1717,16 +1770,14 @@ class RequestBridge(WebSocketBridge):
                     sni=self._flow.request.host_header,
                     alpn_protocols=H3_ALPN + H0_ALPN,
                 )
-            self.set_stream_id(
-                ProxySide.server, self.server._quic.get_next_available_stream_id()
-            )
+            self.server.create_stream_id(self)
 
             # forward the request to the server
             self.send(to_side=ProxySide.server, headers=self.build_request_headers())
             if is_websocket:
                 pass
             elif self._flow.request.stream:
-                await self.pump_data(
+                await self.stream_data_and_forward_trailers(
                     from_side=ProxySide.client,
                     to_side=ProxySide.server,
                     cb=self._flow.request.stream,
@@ -1739,12 +1790,14 @@ class RequestBridge(WebSocketBridge):
                 )
 
             # wait for the response headers and allow alternations
-            self._flow.response = self._build_flow_response(await self._get_headers_from_server())
+            self._flow.response = self._build_flow_response(
+                await self._get_headers_from_server()
+            )
             await self.context.ask("responseheaders", self._flow)
             if is_websocket or self._flow.response.stream:
                 self._flow.response.data.content = None
             else:
-                await self.read_data(
+                await self.receive_data_and_trailers(
                     from_side=ProxySide.server, to_object=self._flow.response
                 )
         else:
@@ -1769,7 +1822,7 @@ class RequestBridge(WebSocketBridge):
 
             # stream or send the data
             if self._flow.response.stream:
-                await self.pump_data(
+                await self.stream_data_and_forward_trailers(
                     from_side=ProxySide.server,
                     to_side=ProxySide.client,
                     cb=self._flow.response.stream,
