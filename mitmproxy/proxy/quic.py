@@ -38,6 +38,7 @@ from mitmproxy import proxy
 from mitmproxy import tcp
 from mitmproxy import websocket
 from mitmproxy.net.http import url
+from mitmproxy.net.http.status_codes import RESPONSES
 
 import OpenSSL
 import wsproto
@@ -883,9 +884,9 @@ class Bridge:
 
     def _is_stream_writeable(self, stream_id: int, side: ProxySide) -> bool:
         # from QUIC protocol perspective, the server side acts like the client
-        return stream_is_client_initiated(
-            stream_id
-        ) == side is ProxySide.server or not stream_is_unidirectional(stream_id)
+        return stream_is_client_initiated(stream_id) == (
+            side is ProxySide.server
+        ) or not stream_is_unidirectional(stream_id)
 
     @property
     def can_receive(self) -> Tuple[bool, bool]:
@@ -1124,7 +1125,7 @@ class HttpBridge(Bridge):
         path: bytes
 
         # initialize pseudo headers and ordinary ones
-        pseudo_headers, headers = self.parse_headers(
+        pseudo_headers, headers = self.check_and_split_pseudo_headers(
             self._headers, RequestPseudoHeaders
         )
         for header, value in headers:
@@ -1284,9 +1285,7 @@ class HttpBridge(Bridge):
     def _handle_flow_error(self, exc: FlowError) -> None:
         # log the error
         self.log(
-            LogLevel.warn,
-            exc.message,
-            {"stacktrace": "\n" + traceback.format_exc()},
+            LogLevel.warn, exc.message, {"stacktrace": "\n" + traceback.format_exc()},
         )
 
         # try to send the status
@@ -1336,25 +1335,18 @@ class HttpBridge(Bridge):
     def build_request_headers(self) -> Headers:
         headers: Headers = list()
 
-        def add_pseudo_header(
-            header: RequestPseudoHeaders, value: Optional[bytes]
-        ) -> None:
+        # helper function
+        def add_header(header: RequestPseudoHeaders, value: Optional[str]) -> None:
             if value is not None:
-                headers.append((b":" + header.name.encode(), value))
+                headers.append((b":" + header.name.encode(), value.encode()))
 
         # add all known pseudo headers
-        add_pseudo_header(
-            RequestPseudoHeaders.method, self._flow.request.method.encode()
-        )
-        add_pseudo_header(
-            RequestPseudoHeaders.scheme, self._flow.request.scheme.encode()
-        )
-        add_pseudo_header(
-            RequestPseudoHeaders.authority, self._flow.request.host_header.encode()
-        )
-        add_pseudo_header(RequestPseudoHeaders.path, self._flow.request.path.encode())
+        add_header(RequestPseudoHeaders.method, self._flow.request.method)
+        add_header(RequestPseudoHeaders.scheme, self._flow.request.scheme)
+        add_header(RequestPseudoHeaders.authority, self._flow.request.host_header)
+        add_header(RequestPseudoHeaders.path, self._flow.request.path)
         if self._flow.metadata.get("websocket", False):
-            add_pseudo_header(RequestPseudoHeaders.protocol, b"websocket")
+            add_header(RequestPseudoHeaders.protocol, "websocket")
 
         # add all but the host header
         for header, value in self._flow.request.headers.fields:
@@ -1369,8 +1361,9 @@ class HttpBridge(Bridge):
         headers.append((b":status", str(self._flow.response.status_code).encode()))
         for header, value in self._flow.response.headers.fields:
             headers.append((header.lower(), value))
+        return headers
 
-    def parse_headers(
+    def check_and_split_pseudo_headers(
         self, headers: Headers, pseudo_header_type: Type
     ) -> Tuple[Dict[PseudoHeaders, bytes], List[Tuple[bytes, bytes]]]:
         known_pseudo_headers: Dict[bytes, PseudoHeaders] = {
@@ -1455,12 +1448,19 @@ class HttpBridge(Bridge):
         end_stream: bool = False,
     ) -> None:
         def internal_send(proto: ConnectionProtocol, stream_id: int) -> None:
+            self.log(LogLevel.debug, "Sending...", {
+                "to": to_side.name,
+                "headers": None if headers is None else len(headers),
+                "data": None if data is None else len(data),
+                "trailers": None if trailers is None else len(trailers),
+                "end_stream": end_stream,
+            })
             if headers is not None:
-                proto._http.send_headers(stream_id, headers)
+                proto._http.send_headers(stream_id, headers, end_stream=False)
             if data is not None:
-                proto._http.send_data(stream_id, data, False)
+                proto._http.send_data(stream_id, data, end_stream=False)
             if trailers is not None:
-                proto._http.send_headers(stream_id, trailers)
+                proto._http.send_headers(stream_id, trailers, end_stream=False)
 
         super().send(to_side=to_side, cb=internal_send, end_stream=end_stream)
 
@@ -1556,7 +1556,7 @@ class PushBridge(HttpBridge):
             await self.context.ask("responseheaders", self._flow)
 
         # allow changing the body
-        self.log(LogLevel.debug, [repr(self._flow.response)])
+        self.log(LogLevel.debug, repr(self._flow.response))
         await self.context.ask("response", self._flow)
 
         # ensure proper response configuration
@@ -1753,14 +1753,17 @@ class RequestBridge(WebSocketBridge):
         )
 
     def _build_flow_response(self, headers: Headers) -> http.HTTPResponse:
-        pseudo_headers, headers = self.parse_headers(headers, ResponsePseudoHeaders)
+        pseudo_headers, headers = self.check_and_split_pseudo_headers(
+            headers, ResponsePseudoHeaders
+        )
         status_code = pseudo_headers.get(ResponsePseudoHeaders.status)
         if status_code is None:
             raise ProtocolError(f"Pseudo header :status is missing.")
+        status_code = int(status_code.decode())
         return http.HTTPResponse(
             http_version=self._flow.request.http_version,
-            status_code=int(status_code.decode()),
-            reason=b"",
+            status_code=status_code,
+            reason=RESPONSES.get(status_code, "Unknown"),
             headers=headers,
             content=None,
             timestamp_start=time.time(),
@@ -1858,7 +1861,7 @@ class RequestBridge(WebSocketBridge):
             await self.context.ask("responseheaders", self._flow)
 
         # allow changing the body
-        self.log(LogLevel.debug, [repr(self._flow.response)])
+        self.log(LogLevel.debug, repr(self._flow.response))
         await self.context.ask("response", self._flow)
 
         # always send the headers and handle the rest differently
