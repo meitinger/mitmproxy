@@ -3,8 +3,8 @@ import asyncio
 import collections
 import enum
 import functools
-import ssl
 import socket
+import ssl
 import sys
 import time
 import traceback
@@ -1914,7 +1914,7 @@ async def quicServer(config: proxy.ProxyConfig, channel: controller.Channel) -> 
     context = ProxyContext(config, channel)
     hostname = socket.gethostname().encode("idna")
     certificate, certificate_chain, private_key = context.generate_certificate(
-        hostname, {b"localhost", b"::1", b"127.0.0.1", hostname}, b"mitmproxy/quic"
+        hostname, {b"localhost", hostname}, b"mitmproxy/quic"
     )
 
     # start serving
