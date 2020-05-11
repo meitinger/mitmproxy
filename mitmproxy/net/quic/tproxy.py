@@ -4,8 +4,15 @@ import collections
 import ipaddress
 import socket
 import struct
-from typing import Callable, Tuple, Union
+from asyncio import BaseProtocol
+from asyncio.transports import BaseTransport, DatagramTransport
+from typing import cast, Any, Callable, Dict, Optional, Tuple, Union
 
+from aioquic.asyncio import QuicConnectionProtocol
+from aioquic.asyncio.protocol import QuicStreamHandler
+from aioquic.asyncio.server import QuicServer
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.tls import SessionTicketFetcher, SessionTicketHandler
 
 IP_PKTINFO = getattr(socket, "IP_PKTINFO", 8)
 IP_RECVORIGDSTADDR = getattr(socket, "IP_RECVORIGDSTADDR", 20)
@@ -175,9 +182,7 @@ async def create_tproxy_endpoint(
     return transport, protocol
 
 
-class _TProxyTransport(
-    asyncio.selector_events._SelectorTransport, TProxyTransport
-):
+class _TProxyTransport(asyncio.selector_events._SelectorTransport, TProxyTransport):
 
     _buffer_factory = collections.deque
 
@@ -327,3 +332,110 @@ class _TProxyTransport(
                 return
         self._buffer.append((bytes(data), src, dst))  # make a copy of data
         self._maybe_pause_protocol()
+
+
+class QuicTransparentProxy(TProxyProtocol):
+    def __init__(
+        self,
+        *,
+        configuration: QuicConfiguration,
+        create_protocol: Callable = QuicConnectionProtocol,
+        session_ticket_fetcher: Optional[SessionTicketFetcher] = None,
+        session_ticket_handler: Optional[SessionTicketHandler] = None,
+        stateless_retry: bool = False,
+        stream_handler: Optional[QuicStreamHandler] = None,
+    ) -> None:
+        self._configuration = configuration
+        self._create_protocol = create_protocol
+        self._session_ticket_fetcher = session_ticket_fetcher
+        self._session_ticket_handler = session_ticket_handler
+        self._stateless_retry = stateless_retry
+        self._stream_handler = stream_handler
+        self._transport: Optional[TProxyTransport] = None
+        self._servers: Dict[tuple, QuicServer] = {}
+
+    def connection_made(self, transport: BaseTransport) -> None:
+        self._transport = cast(TProxyTransport, transport)
+
+    def received_from(
+        self, data: Union[bytes, bytearray, memoryview], src: sockaddr, dst: sockaddr,
+    ) -> None:
+        server: QuicServer
+        if dst not in self._servers:
+            server = QuicServer(
+                configuration=self._configuration,
+                create_protocol=self._create_protocol,
+                session_ticket_fetcher=self._session_ticket_fetcher,
+                session_ticket_handler=self._session_ticket_handler,
+                stateless_retry=self._stateless_retry,
+                stream_handler=self._stream_handler,
+            )
+            self._servers[dst] = server
+            server.connection_made(QuicTransport(proxy=self, addr=dst, server=server))
+        else:
+            server = self._servers[dst]
+        server.datagram_received(data, src)
+
+
+class QuicTransport(DatagramTransport):
+    def __init__(
+        self, *, proxy: QuicTransparentProxy, addr: sockaddr, server: QuicServer
+    ) -> None:
+        self._proxy = proxy
+        self._addr = addr
+        self._server = server
+
+    def abort(self) -> None:
+        self._transport.abort()
+        self._proxy._servers.clear()
+
+    def close(self) -> None:
+        if not self.is_closing():
+            self._proxy._servers.pop(self._addr)
+
+    def get_extra_info(self, name: str, default: Any = None) -> Any:
+        return (
+            self._addr
+            if name == "sockname"
+            else self._proxy._transport.get_extra_info(name, default)
+        )
+
+    def get_protocol(self) -> BaseProtocol:
+        return self._server
+
+    def is_closing(self) -> bool:
+        return self._proxy._servers.get(self._addr) is not self._server
+
+    def sendto(
+        self, data: Union[bytes, bytearray, memoryview], addr: sockaddr = None
+    ) -> None:
+        if not self.is_closing():
+            self._proxy._transport.send_to(data, self._addr, addr)
+
+
+async def transparent_serve(
+    host: str,
+    port: int,
+    *,
+    configuration: QuicConfiguration,
+    create_protocol: Callable = QuicConnectionProtocol,
+    session_ticket_fetcher: Optional[SessionTicketFetcher] = None,
+    session_ticket_handler: Optional[SessionTicketHandler] = None,
+    stateless_retry: bool = False,
+    stream_handler: QuicStreamHandler = None,
+) -> QuicTransparentProxy:
+    loop = asyncio.get_event_loop()
+
+    _, protocol = await create_tproxy_endpoint(
+        loop=loop,
+        protocol_factory=lambda: QuicTransparentProxy(
+            configuration=configuration,
+            create_protocol=create_protocol,
+            session_ticket_fetcher=session_ticket_fetcher,
+            session_ticket_handler=session_ticket_handler,
+            stateless_retry=stateless_retry,
+            stream_handler=stream_handler,
+        ),
+        local_addr=(host, port),
+    )
+    return cast(QuicTransparentProxy, protocol)

@@ -37,6 +37,7 @@ from mitmproxy import tcp
 from mitmproxy import websocket
 from mitmproxy.net.http import url
 from mitmproxy.net.http.status_codes import RESPONSES
+from mitmproxy.net.quic import transparent_serve
 from mitmproxy.utils.strutils import bytes_to_escaped_str
 
 import OpenSSL
@@ -1918,9 +1919,10 @@ async def quicServer(config: proxy.ProxyConfig, channel: controller.Channel) -> 
     )
 
     # start serving
-    if context.mode is ProxyMode.transparent:
-        raise exceptions.OptionsError(f"Transparent mode not yet supported.")
-    await serve(
+    server_method = (
+        transparent_serve if context.mode is ProxyMode.transparent else serve
+    )
+    await server_method(
         context.options.listen_host or "::",
         context.options.listen_port,
         configuration=QuicConfiguration(
