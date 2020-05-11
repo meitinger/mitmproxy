@@ -91,28 +91,10 @@ from aioquic.tls import (
     pull_server_hello,
 )
 
-
-HttpConnection = Union[H0Connection, H3Connection]
-
+PARSE_HOST_HEADER = re.compile(r"^(?P<host>[^:]+|\[.+\])(?::(?P<port>\d+))?$")
 SERVER_NAME = "mitmproxy/" + VERSION
 
-# taken from dns_spoofing
-PARSE_HOST_HEADER = re.compile(r"^(?P<host>[^:]+|\[.+\])(?::(?P<port>\d+))?$")
-
-
-class RequestPseudoHeaders(enum.Enum):
-    method = 1
-    scheme = 2
-    authority = 3
-    path = 4
-    protocol = 5
-
-
-class ResponsePseudoHeaders(enum.Enum):
-    status = 1
-
-
-PseudoHeaders = Union[RequestPseudoHeaders, ResponsePseudoHeaders]
+HttpConnection = Union[H0Connection, H3Connection]
 
 
 class LogLevel(enum.Enum):
@@ -137,6 +119,21 @@ class ProxySide(enum.IntEnum):
     @property
     def other_side(self) -> ProxySide:
         return ProxySide.server if self is ProxySide.client else ProxySide.client
+
+
+class RequestPseudoHeaders(enum.Enum):
+    method = 1
+    scheme = 2
+    authority = 3
+    path = 4
+    protocol = 5
+
+
+class ResponsePseudoHeaders(enum.Enum):
+    status = 1
+
+
+PseudoHeaders = Union[RequestPseudoHeaders, ResponsePseudoHeaders]
 
 
 class FlowError(Exception):
@@ -308,19 +305,6 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 "The current connection must either be the client or server connection."
             )
 
-    @property
-    def address(self) -> Tuple[str, int]:
-        return self._quic._network_paths[0].addr[0:2]
-
-    @address.setter
-    def address(self, address: Tuple[str, int]) -> None:
-        if address is not None:
-            raise PermissionError
-
-    @property
-    def context(self) -> ProxyContext:
-        return self._client.context
-
     def _handle_http_data_received(self, event: DataReceived) -> None:
         event_description = {
             "data_length": len(event.data),
@@ -334,6 +318,26 @@ class ConnectionProtocol(QuicConnectionProtocol):
             return
         bridge = self._bridges[event.stream_id]
         bridge.post_data(self._side, event.data)
+
+    def _handle_http_event(self, event: H3Event) -> None:
+        if isinstance(event, HeadersReceived):
+            if event.push_id is None:
+                self._handle_http_headers_received(event)
+            else:
+                self._handle_http_push_headers_or_data_received(event)
+        elif isinstance(event, DataReceived):
+            if event.push_id is None:
+                self._handle_http_data_received(event)
+            else:
+                self._handle_http_push_headers_or_data_received(event)
+        elif isinstance(event, PushPromiseReceived):
+            self._handle_http_push_promise_received(event)
+        else:
+            self.log(
+                LogLevel.warn,
+                "Unknown H3Event received",
+                {"type": type(event).__name__},
+            )
 
     def _handle_http_headers_received(self, event: HeadersReceived) -> None:
         event_description = {
@@ -360,26 +364,6 @@ class ConnectionProtocol(QuicConnectionProtocol):
         else:
             bridge = self._bridges[event.stream_id]
             bridge.post_data(self._side, event.headers, is_header=True)
-
-    def _handle_http_event(self, event: H3Event) -> None:
-        if isinstance(event, HeadersReceived):
-            if event.push_id is None:
-                self._handle_http_headers_received(event)
-            else:
-                self._handle_http_push_headers_or_data_received(event)
-        elif isinstance(event, DataReceived):
-            if event.push_id is None:
-                self._handle_http_data_received(event)
-            else:
-                self._handle_http_push_headers_or_data_received(event)
-        elif isinstance(event, PushPromiseReceived):
-            self._handle_http_push_promise_received(event)
-        else:
-            self.log(
-                LogLevel.warn,
-                "Unknown H3Event received",
-                {"type": type(event).__name__},
-            )
 
     def _handle_http_push_headers_or_data_received(
         self, event: Union[HeadersReceived, DataReceived]
@@ -516,6 +500,15 @@ class ConnectionProtocol(QuicConnectionProtocol):
         bridge = self._bridges[event.stream_id]
         bridge.end_stream_cb(self._side, event.stream_id)
 
+    @property
+    def address(self) -> Tuple[str, int]:
+        return self._quic._network_paths[0].addr[0:2]
+
+    @address.setter
+    def address(self, address: Tuple[str, int]) -> None:
+        if address is not None:
+            raise PermissionError
+
     def close(
         self,
         error_code: int = QuicErrorCode.NO_ERROR,
@@ -552,6 +545,10 @@ class ConnectionProtocol(QuicConnectionProtocol):
                 "by_peer": not self._local_close,
             },
         )
+
+    @property
+    def context(self) -> ProxyContext:
+        return self._client.context
 
     def establish_tls(self, *args, **kwargs):
         # there is no other way
