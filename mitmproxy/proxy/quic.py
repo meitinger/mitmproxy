@@ -56,6 +56,7 @@ from ..version import VERSION
 
 
 from aioquic.asyncio import QuicConnectionProtocol, serve
+from aioquic.buffer import Buffer
 from aioquic.h0.connection import H0_ALPN, H0Connection
 from aioquic.h3.connection import H3_ALPN, H3Connection, ProtocolError, FrameUnexpected
 from aioquic.h3.events import (
@@ -80,11 +81,14 @@ from aioquic.quic.events import (
 )
 from aioquic.quic.packet import QuicErrorCode
 from aioquic.tls import (
+    CipherSuite,
     ClientHello,
     Context as TlsContext,
     SessionTicket,
     load_pem_private_key,
     load_pem_x509_certificates,
+    pull_client_hello,
+    pull_server_hello,
 )
 
 
@@ -282,6 +286,17 @@ class ConnectionProtocol(QuicConnectionProtocol):
         self._local_close: bool = False
         self._client: IncomingProtocol = client
         self._server: Optional[OutgoingProtocol] = server
+
+        # patch QuicConnection._initialize
+        orig_initialize = self._quic._initialize
+
+        def initialize_replacement(*args, **kwargs):
+            try:
+                return orig_initialize(*args, **kwargs)
+            finally:
+                self.patch_tls(self._quic.tls)
+
+        self._quic._initialize = initialize_replacement
 
         # determine the side
         if self is client:
@@ -555,7 +570,6 @@ class ConnectionProtocol(QuicConnectionProtocol):
 
         # store the security details
         self.alpn_proto_negotiated = event.alpn_protocol.encode("utf8")
-        self.cipher_name = event.cipher_name
         self.timestamp_tls_setup = time.time()
         self.tls_established = True
         self.tls_version = "TLSv1.3"
@@ -566,7 +580,6 @@ class ConnectionProtocol(QuicConnectionProtocol):
             "TLS established.",
             {
                 "alpn_protocol": event.alpn_protocol,
-                "cipher_name": event.cipher_name,
                 "early_data_accepted": event.early_data_accepted,
                 "session_resumed": event.session_resumed,
             },
@@ -576,6 +589,9 @@ class ConnectionProtocol(QuicConnectionProtocol):
         self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
     ) -> None:
         raise NotImplementedError
+
+    def patch_tls(self, tls: TlsContext) -> None:
+        pass
 
     def quic_event_received(self, event: QuicEvent) -> None:
         # handle known events
@@ -631,10 +647,24 @@ class OutgoingProtocol(ConnectionProtocol, connections.ServerConnection):
 
     def handshake_complete(self, event: HandshakeCompleted) -> None:
         super().handshake_complete(event)
-        self.cert = self.context.convert_certificate(event.certificates[0])
+        self.cert = self.context.convert_certificate(self._quic.tls._peer_certificate)
         self.server_certs = [
-            self.context.convert_certificate(cert) for cert in event.certificates[1:]
+            self.context.convert_certificate(cert)
+            for cert in self._quic.tls._peer_certificate_chain
         ]
+
+    def patch_tls(self, tls: TlsContext) -> None:
+        # hook the client hello to get the cipher name
+        orig_client_handle_hello = tls._client_handle_hello
+
+        def client_handle_hello_replacement(input_buf: Buffer, *args, **kwargs) -> Any:
+            pos = input_buf.tell()
+            server_hello = pull_server_hello(input_buf)
+            input_buf.seek(pos)
+            self.cipher_name = CipherSuite(server_hello.cipher_suite).name
+            return orig_client_handle_hello(input_buf, *args, **kwargs)
+
+        tls._client_handle_hello = client_handle_hello_replacement
 
     @property
     def source_address(self) -> Tuple[str, int]:
@@ -652,18 +682,8 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         connections.ClientConnection.__init__(self, None, None, None)
         self._context: ProxyContext = context
         self._servers: Dict[Tuple[str, int], OutgoingProtocol] = {}
-        orig_initialize = self._quic._initialize
 
-        def initialize_replacement(*args, **kwargs):
-            try:
-                return orig_initialize(*args, **kwargs)
-            finally:
-                self._quic.tls.client_hello_cb = self._handle_client_hello
-
-        self._quic._initialize = initialize_replacement
-
-    def _handle_client_hello(self, hello: ClientHello) -> None:
-        tls: TlsContext = self._quic.tls
+    def _handle_client_hello(self, tls: TlsContext, hello: ClientHello) -> None:
         host: bytes = None
         sans: Set = set()
         organization: Optional[str] = None
@@ -806,14 +826,10 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
         await protocol.wait_connected()
         return protocol
 
-    def datagram_received(
-        self, data: bytes, addr: Tuple, orig_dst: Optional[Tuple] = None
-    ) -> None:
+    def datagram_received(self, data: bytes, addr: Tuple) -> None:
         try:
             if self.tls_established:
-                self._quic.receive_datagram(
-                    cast(bytes, data), addr, self._loop.time(), orig_dst
-                )
+                self._quic.receive_datagram(cast(bytes, data), addr, self._loop.time())
                 self._process_events()
                 self.transmit()
             else:
@@ -825,31 +841,40 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
                     bytes(data),
                     addr,
                     self._loop.time(),
-                    orig_dst,
                 ).add_done_callback(self._process_events_and_transmit)
         except:
             handle_except(self)
 
     def handshake_complete(self, event: HandshakeCompleted) -> None:
         super().handshake_complete(event)
-        self.mitmcert = self.context.convert_certificate(event.certificates[0])
+        self.mitmcert = self.context.convert_certificate(self._quic.tls.certificate)
 
     def log(
         self, level: LogLevel, msg: str, additional: Optional[Dict[str, str]] = None
     ) -> None:
         self.context.log("in", self.address, self.server, level, msg, additional)
 
+    def patch_tls(self, tls: TlsContext) -> None:
+        # hook the server hello to set the certificate and get the cipher name
+        orig_server_handle_hello = tls._server_handle_hello
+
+        def server_handle_hello_replacement(input_buf: Buffer, *args, **kwargs) -> Any:
+            pos = input_buf.tell()
+            client_hello = pull_client_hello(input_buf)
+            input_buf.seek(pos)
+            self._handle_client_hello(tls, client_hello)
+            if client_hello.cipher_suites is not None:
+                for c in tls._cipher_suites:
+                    if c in client_hello.cipher_suites:
+                        self.cipher_name = c.name
+                        break
+            return orig_server_handle_hello(input_buf, *args, **kwargs)
+
+        tls._server_handle_hello = server_handle_hello_replacement
+
     @property
     def server(self) -> Tuple[str, int]:
-        orig_dst = self._quic._network_paths[0].orig_dst
-        if orig_dst is None:
-            orig_dst = self._transport.get_extra_info("sockname")
-        if orig_dst[0] == "::":
-            return ("::1", orig_dst[1])
-        elif orig_dst[0] == "0.0.0.0":
-            return ("127.0.0.1", orig_dst[1])
-        else:
-            return orig_dst[0:2]
+        return self._transport.get_extra_info("sockname")[0:2]
 
     @server.setter
     def server(self, server: Tuple[str, int]) -> None:
@@ -1896,6 +1921,8 @@ async def quicServer(config: proxy.ProxyConfig, channel: controller.Channel) -> 
     )
 
     # start serving
+    if context.mode is ProxyMode.transparent:
+        raise exceptions.OptionsError(f"Transparent mode not yet supported.")
     await serve(
         context.options.listen_host or "::",
         context.options.listen_port,
@@ -1904,7 +1931,6 @@ async def quicServer(config: proxy.ProxyConfig, channel: controller.Channel) -> 
             if context.mode is ProxyMode.regular
             else None,
             is_client=False,
-            is_transparent=context.mode is ProxyMode.transparent,
             secrets_log_file=log_master_secret,
             certificate=certificate,
             certificate_chain=certificate_chain,
