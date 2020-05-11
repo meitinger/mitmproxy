@@ -3,6 +3,7 @@ import asyncio
 import collections
 import enum
 import functools
+import ipaddress
 import socket
 import ssl
 import sys
@@ -804,11 +805,17 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
                 capath=self.context.options.ssl_verify_upstream_trusted_confdir,
             )
         )
+
         if self.context.options.spoof_source_address:
             self.log(LogLevel.info, "Source address spoofing not yet supported.")
         _, protocol = await self._loop.create_datagram_endpoint(
             functools.partial(OutgoingProtocol, self, connection),
-            local_addr=(self.context.options.listen_host or "::", 0),
+            local_addr=(
+                "::"
+                if ipaddress.ip_address(remote_addr[0]).version == 6
+                else "0.0.0.0",
+                0,
+            ),
         )
 
         # recheck (there was an await in between)
@@ -1919,10 +1926,8 @@ async def quicServer(config: proxy.ProxyConfig, channel: controller.Channel) -> 
     )
 
     # start serving
-    server_method = (
-        transparent_serve if context.mode is ProxyMode.transparent else serve
-    )
-    await server_method(
+    serve_method = transparent_serve if context.mode is ProxyMode.transparent else serve
+    await serve_method(
         context.options.listen_host or "::",
         context.options.listen_port,
         configuration=QuicConfiguration(
