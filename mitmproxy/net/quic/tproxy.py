@@ -1,11 +1,8 @@
 import asyncio
-import asyncio.selector_events
 import collections
 import ipaddress
 import socket
 import struct
-from asyncio import BaseProtocol
-from asyncio.transports import BaseTransport, DatagramTransport
 from typing import cast, Any, Callable, Dict, Optional, Tuple, Union
 
 from aioquic.asyncio import QuicConnectionProtocol
@@ -16,7 +13,7 @@ from aioquic.tls import SessionTicketFetcher, SessionTicketHandler
 
 IP_PKTINFO = getattr(socket, "IP_PKTINFO", 8)
 IP_RECVORIGDSTADDR = getattr(socket, "IP_RECVORIGDSTADDR", 20)
-sockaddr = Union[tuple, str]
+sockaddr = tuple
 
 
 def _native_sockaddr_to_python(sockaddr_in: bytes) -> sockaddr:
@@ -130,9 +127,7 @@ def _create_raw_socket(family: int, level: int) -> socket.socket:
 
 
 class TProxyProtocol(asyncio.BaseProtocol):
-    def received_from(
-        self, data: Union[bytes, bytearray, memoryview], src: sockaddr, dst: sockaddr,
-    ) -> None:
+    def received_from(self, data: bytes, src: sockaddr, dst: sockaddr,) -> None:
         pass
 
     def error_received(self, exc: OSError) -> None:
@@ -140,9 +135,7 @@ class TProxyProtocol(asyncio.BaseProtocol):
 
 
 class TProxyTransport(asyncio.BaseTransport):
-    def send_to(
-        self, data: Union[bytes, bytearray, memoryview], src: sockaddr, dst: sockaddr,
-    ) -> None:
+    def send_to(self, data: bytes, src: sockaddr, dst: sockaddr,) -> None:
         raise NotImplementedError
 
     def abort(self) -> None:
@@ -219,9 +212,7 @@ class _TProxyTransport(asyncio.selector_events._SelectorTransport, TProxyTranspo
             self._send_sock.close()
             self._send_sock = None
 
-    def _internal_send(
-        self, data: Union[bytes, bytearray, memoryview], src: sockaddr, dst: sockaddr
-    ) -> None:
+    def _internal_send(self, data: bytes, src: sockaddr, dst: sockaddr) -> None:
         # Since dst should be an IP optained by self._sock, it has to match its IP version.
         dst_ip = ipaddress.ip_address(dst[0])
         if dst_ip.version != self._ip_version:
@@ -311,9 +302,7 @@ class _TProxyTransport(asyncio.selector_events._SelectorTransport, TProxyTranspo
             if self._closing:
                 self._call_connection_lost(None)
 
-    def send_to(
-        self, data: Union[bytes, bytearray, memoryview], src: sockaddr, dst: sockaddr
-    ) -> None:
+    def send_to(self, data: bytes, src: sockaddr, dst: sockaddr) -> None:
         if not data:
             return
         if not self._buffer:
@@ -354,12 +343,10 @@ class QuicTransparentProxy(TProxyProtocol):
         self._transport: Optional[TProxyTransport] = None
         self._servers: Dict[tuple, QuicServer] = {}
 
-    def connection_made(self, transport: BaseTransport) -> None:
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = cast(TProxyTransport, transport)
 
-    def received_from(
-        self, data: Union[bytes, bytearray, memoryview], src: sockaddr, dst: sockaddr,
-    ) -> None:
+    def received_from(self, data: bytes, src: sockaddr, dst: sockaddr,) -> None:
         server: QuicServer
         if dst not in self._servers:
             server = QuicServer(
@@ -377,7 +364,7 @@ class QuicTransparentProxy(TProxyProtocol):
         server.datagram_received(data, src)
 
 
-class QuicTransport(DatagramTransport):
+class QuicTransport(asyncio.DatagramTransport):
     def __init__(
         self, *, proxy: QuicTransparentProxy, addr: sockaddr, server: QuicServer
     ) -> None:
@@ -400,15 +387,13 @@ class QuicTransport(DatagramTransport):
             else self._proxy._transport.get_extra_info(name, default)
         )
 
-    def get_protocol(self) -> BaseProtocol:
+    def get_protocol(self) -> asyncio.BaseProtocol:
         return self._server
 
     def is_closing(self) -> bool:
         return self._proxy._servers.get(self._addr) is not self._server
 
-    def sendto(
-        self, data: Union[bytes, bytearray, memoryview], addr: sockaddr = None
-    ) -> None:
+    def sendto(self, data: bytes, addr: sockaddr = None) -> None:
         if not self.is_closing():
             self._proxy._transport.send_to(data, self._addr, addr)
 
