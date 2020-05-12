@@ -806,16 +806,16 @@ class IncomingProtocol(ConnectionProtocol, connections.ClientConnection):
             )
         )
 
+        # spoofing is not yet supported, but un-map IPv4 addresses
         if self.context.options.spoof_source_address:
             self.log(LogLevel.info, "Source address spoofing not yet supported.")
+        addr = ipaddress.ip_address(remote_addr[0])
+        if addr.version == 6 and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
+            remote_addr = (str(addr), remote_addr[1])
         _, protocol = await self._loop.create_datagram_endpoint(
             functools.partial(OutgoingProtocol, self, connection),
-            local_addr=(
-                "::"
-                if ipaddress.ip_address(remote_addr[0]).version == 6
-                else "0.0.0.0",
-                0,
-            ),
+            local_addr=("::" if addr.version == 6 else "0.0.0.0", 0),
         )
 
         # recheck (there was an await in between)

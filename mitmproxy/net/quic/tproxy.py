@@ -1,9 +1,10 @@
 import asyncio
+import asyncio.selector_events
 import collections
 import ipaddress
 import socket
 import struct
-from typing import cast, Any, Callable, Dict, Optional, Tuple, Union
+from typing import cast, Any, Callable, Dict, Optional, Tuple
 
 from aioquic.asyncio import QuicConnectionProtocol
 from aioquic.asyncio.protocol import QuicStreamHandler
@@ -25,13 +26,13 @@ def _native_sockaddr_to_python(sockaddr_in: bytes) -> sockaddr:
         if len(sockaddr_in) < 16:
             raise ValueError("sockaddr_in too short for IPv4")
         port, in_addr, _ = struct.unpack("!H4s8s", sockaddr_in[2:16])
-        addr = (ipaddress.IPv4Address(in_addr).__str__(), port)
+        addr = (str(ipaddress.IPv4Address(in_addr)), port)
     elif family == socket.AF_INET6:
         if len(sockaddr_in) < 28:
             raise ValueError("sockaddr_in too short for IPv6")
         port, flowinfo, in6_addr, scope_id = struct.unpack("!H16sL", sockaddr_in[2:28])
         addr = (
-            ipaddress.IPv6Address(in6_addr).__str__(),
+            str(ipaddress.IPv6Address(in6_addr)),
             port,
             flowinfo,
             scope_id,
@@ -189,16 +190,20 @@ class _TProxyTransport(asyncio.selector_events._SelectorTransport, TProxyTranspo
     ) -> None:
         super().__init__(loop, sock, protocol)
         self._sock_addr: sockaddr = sock_addr
-        self._ip_version: int
-        self._send_sock: socket.socket
+        self._send_sock_v4: socket.socket
+        self._send_sock_v6: Optional[socket.socket] = None
+
+        # we support dual stacks, so always create an IPv4 send socket
         if sock.family == socket.AF_INET:
-            self._ip_version = 4
-            self._send_sock = _create_raw_socket(socket.AF_INET, socket.IPPROTO_IP)
+            pass
         elif sock.family == socket.AF_INET6:
-            self._ip_version = 6
-            self._send_sock = _create_raw_socket(socket.AF_INET6, socket.IPPROTO_IPV6)
+            self._send_sock_v6 = _create_raw_socket(
+                socket.AF_INET6, socket.IPPROTO_IPV6
+            )
         else:
             raise NotImplementedError(f"Address family {sock.family} not supported")
+        self._send_sock_v4 = _create_raw_socket(socket.AF_INET, socket.IPPROTO_IP)
+
         # notify the protocol, start reading and signal complete
         self._loop.call_soon(self._protocol.connection_made, self)
         self._loop.call_soon(self._add_reader, self._sock_fd, self._read_ready)
@@ -209,51 +214,50 @@ class _TProxyTransport(asyncio.selector_events._SelectorTransport, TProxyTranspo
         try:
             super()._call_connection_lost(exc)
         finally:
-            self._send_sock.close()
-            self._send_sock = None
+            self._send_sock_v4.close()
+            self._send_sock_v4 = None
+            if self._send_sock_v6 is not None:
+                self._send_sock_v6.close()
+                self._send_sock_v6 = None
+
+    def _check_and_unmap_ip_address(self, addr: sockaddr, name: str) -> sockaddr:
+        if not isinstance(addr, tuple) or len(addr) not in [2, 4]:
+            raise ValueError(f"{name} is not a valid socket address")
+        try:
+            ip = ipaddress.ip_address(addr[0])
+        except ValueError:
+            raise ValueError(f"{name} contains an invalid IP address")
+        if ip.version == 4:
+            if len(addr) == 4:
+                raise ValueError(f"{name} has too many components for an IPv4 address")
+        elif ip.version == 6:
+            if ip.ipv4_mapped is not None:
+                addr = (str(ip.ipv4_mapped), addr[1])
+            else:
+                if len(addr) == 2:
+                    addr = addr + (0, 0)
+                if self._send_sock_v6 is None:
+                    raise ValueError(
+                        f"{name} contains an IPv6 address, but the listen socket is IPv4"
+                    )
+        else:
+            raise ValueError(
+                f"{name} contains an IPv{ip.version} address which is not supported"
+            )
+        return addr
 
     def _internal_send(self, data: bytes, src: sockaddr, dst: sockaddr) -> None:
-        # Since dst should be an IP optained by self._sock, it has to match its IP version.
-        dst_ip = ipaddress.ip_address(dst[0])
-        if dst_ip.version != self._ip_version:
-            raise ValueError(
-                f"The destination {dst} is IPv{dst_ip.version}, expected IPv{self._ip_version}"
-            )
+        assert len(src) == len(dst) and len(src) in [2, 4]
 
-        # On local connections, it can happen that src is 0.0.0.0 or ::, change it to 127.0.0.1 or ::1.
-        if src[0] == "::":
-            src = ("::1",) + src[1:3]
-        elif src[0] == "0.0.0.0":
-            src = ("127.0.0.1", src[1])
-
-        # If TPROXY is set to redirect to 0.0.0.0, we can listen on ::1 and still get IPv4 traffic.
-        # So the actual source IP determines what IP version we use to send back.
-        src_ip = ipaddress.ip_address(src[0])
-        version = src_ip.version
-
-        # If src is IPv6, dst should be a mapped IPv4 address.
-        if version == 4 and self._ip_version != 4:
-            dst_ip = dst_ip.ipv4_mapped
-            if dst_ip is None:
-                raise ValueError(
-                    f"Cannot convert source {src} from IPv{self._ip_version} to IPv4"
-                )
-            dst = (dst_ip.__str__(), dst[1])
-
-        # generate the UDP payload and ancillary data depending on the proto
-        if version == 4:
+        # generate the UDP payload and send it
+        if len(src) == 2:
             payload, in_pktinfo = _build_ipv4_udp_payload_and_pktinfo(src, dst, data)
             ancdata = [(socket.IPPROTO_IP, IP_PKTINFO, in_pktinfo)]
-            dst = (dst[0], 0)
-        elif version == 6:
+            self._send_sock_v4.sendmsg([payload], ancdata, 0, (dst[0], 0))
+        else:
             payload, in6_pktinfo = _build_ipv6_udp_payload_and_pktinfo(src, dst, data)
             ancdata = [(socket.IPPROTO_IPV6, socket.IPV6_PKTINFO, in6_pktinfo)]
-            dst = (dst[0], 0, 0, 0)
-        else:
-            raise NotImplementedError
-
-        # send the message
-        self._send_sock.sendmsg([payload], ancdata, 0, dst)
+            self._send_sock_v6.sendmsg([payload], ancdata, 0, (dst[0], 0, 0, 0))
 
     # callback
     def _read_ready(self):
@@ -268,6 +272,11 @@ class _TProxyTransport(asyncio.selector_events._SelectorTransport, TProxyTranspo
             for cmsg_level, cmsg_type, cmsg_data in ancdata:
                 if cmsg_level == socket.SOL_IP and cmsg_type == IP_RECVORIGDSTADDR:
                     dst = _native_sockaddr_to_python(cmsg_data)
+
+            # on a dual stack, receive from IPv4 is possible, return mapped address like src
+            if self._send_sock_v6 is not None and len(dst) == 2:
+                dst = ("::ffff:" + dst[0], dst[1], 0, 0)
+
         except (BlockingIOError, InterruptedError):
             pass
         except OSError as exc:
@@ -280,7 +289,7 @@ class _TProxyTransport(asyncio.selector_events._SelectorTransport, TProxyTranspo
             self._protocol.received_from(data, src, dst)
 
     # callback
-    def _sendto_ready(self):
+    def _write_ready(self):
         while self._buffer:
             data, src, dst = self._buffer.popleft()
             try:
@@ -303,6 +312,12 @@ class _TProxyTransport(asyncio.selector_events._SelectorTransport, TProxyTranspo
                 self._call_connection_lost(None)
 
     def send_to(self, data: bytes, src: sockaddr, dst: sockaddr) -> None:
+        # check the input
+        src = self._check_and_unmap_ip_address(src, "src")
+        dst = self._check_and_unmap_ip_address(dst, "dst")
+        if len(src) != len(dst):
+            raise ValueError("src and dst are different IP versions")
+
         if not data:
             return
         if not self._buffer:
@@ -310,7 +325,7 @@ class _TProxyTransport(asyncio.selector_events._SelectorTransport, TProxyTranspo
                 self._internal_send(data, src, dst)
                 return
             except (BlockingIOError, InterruptedError):
-                self._loop._add_writer(self._sock_fd, self._sendto_ready)
+                self._loop._add_writer(self._sock_fd, self._write_ready)
             except OSError as exc:
                 self._protocol.error_received(exc)
                 return
@@ -341,7 +356,7 @@ class QuicTransparentProxy(TProxyProtocol):
         self._stateless_retry = stateless_retry
         self._stream_handler = stream_handler
         self._transport: Optional[TProxyTransport] = None
-        self._servers: Dict[tuple, QuicServer] = {}
+        self._servers: Dict[sockaddr, QuicServer] = {}
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = cast(TProxyTransport, transport)
