@@ -1326,7 +1326,7 @@ class HttpBridge(Bridge):
         )
         status_code = pseudo_headers.get(ResponsePseudoHeaders.status)
         if status_code is None:
-            raise ProtocolError(f"Pseudo header :status is missing.")
+            raise ProtocolError("Pseudo header :status is missing.")
         status_code = int(status_code.decode("ascii"))
         return http.HTTPResponse(
             http_version=self._flow.request.http_version,
@@ -1586,23 +1586,30 @@ class HttpBridge(Bridge):
     def build_request_headers(self) -> Headers:
         headers: Headers = []
 
-        # helper function
-        def add_header(header: RequestPseudoHeaders, value: Optional[bytes]) -> None:
+        # helper functions
+        def build_header(
+            header: RequestPseudoHeaders, value: bytes
+        ) -> Tuple[bytes, bytes]:
+            return (b":" + header.name.encode("ascii"), value)
+
+        def add_header_if_set(
+            header: RequestPseudoHeaders, value: Optional[bytes]
+        ) -> None:
             if value is not None:
-                headers.append((b":" + header.name.encode("ascii"), value))
+                headers.append(build_header(header, value))
 
         # add all translateable pseudo headers
-        add_header(RequestPseudoHeaders.method, self._flow.request.data.method)
-        add_header(RequestPseudoHeaders.scheme, self._flow.request.data.scheme)
-        add_header(RequestPseudoHeaders.path, self._flow.request.data.path)
+        add_header_if_set(RequestPseudoHeaders.method, self._flow.request.data.method)
+        add_header_if_set(RequestPseudoHeaders.scheme, self._flow.request.data.scheme)
+        add_header_if_set(RequestPseudoHeaders.path, self._flow.request.data.path)
         if self._flow.metadata.get("websocket", False):
-            add_header(RequestPseudoHeaders.protocol, b"websocket")
+            headers.append(build_header(RequestPseudoHeaders.protocol, b"websocket"))
 
         # add all but the host header
         for header, value in self._flow.request.headers.fields:
             header = header.lower()
             if header == b"host":
-                add_header(RequestPseudoHeaders.authority, value)
+                headers.insert(0, build_header(RequestPseudoHeaders.authority, value))
             else:
                 headers.append((header, value))
         return headers
