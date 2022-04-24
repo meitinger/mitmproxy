@@ -27,7 +27,6 @@ SockAddress = Union[Tuple[str, int], Tuple[str, int, int, int]]
 
 
 class TransparentSocket(socket.socket):
-    SOL_IP = getattr(socket, "SOL_IP", 0)
     IP_TRANSPARENT = getattr(socket, "IP_TRANSPARENT", 19)
     IP_RECVORIGDSTADDR = getattr(socket, "IP_RECVORIGDSTADDR", 20)
 
@@ -38,8 +37,8 @@ class TransparentSocket(socket.socket):
         super().__init__(family=family, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP)
         try:
             self.setblocking(False)
-            self.setsockopt(TransparentSocket.SOL_IP, TransparentSocket.IP_TRANSPARENT, 1)
-            self.setsockopt(TransparentSocket.SOL_IP, TransparentSocket.IP_RECVORIGDSTADDR, 1)
+            self.setsockopt(socket.SOL_IP, TransparentSocket.IP_TRANSPARENT, 1)
+            self.setsockopt(socket.SOL_IP, TransparentSocket.IP_RECVORIGDSTADDR, 1)
             self.bind(local_addr)
         except:
             self.close()
@@ -64,7 +63,7 @@ class TransparentSocket(socket.socket):
 
         data, ancdata, _, client_addr = self._recvmsg(bufsize, socket.CMSG_SPACE(1024), flags)
         for cmsg_level, cmsg_type, cmsg_data in ancdata:
-            if cmsg_level == TransparentSocket.SOL_IP and cmsg_type == TransparentSocket.IP_RECVORIGDSTADDR:
+            if cmsg_level == socket.SOL_IP and cmsg_type == TransparentSocket.IP_RECVORIGDSTADDR:
                 server_addr = TransparentSocket._unpack_addr(cmsg_data)
                 break
         else:
@@ -76,14 +75,12 @@ class DrainableDatagramProtocol(asyncio.DatagramProtocol):
 
     _loop: asyncio.AbstractEventLoop
     _closed: asyncio.Event
-    _paused: int
     _can_write: asyncio.Event
     _sock: Optional[socket.socket]
 
     def __init__(self, loop: Optional[asyncio.AbstractEventLoop]) -> None:
         self._loop = asyncio.get_running_loop() if loop is None else loop
         self._closed = asyncio.Event()
-        self._paused = 0
         self._can_write = asyncio.Event()
         self._can_write.set()
         self._sock = None
@@ -104,15 +101,10 @@ class DrainableDatagramProtocol(asyncio.DatagramProtocol):
             ctx.log.warn(f"Connection lost on {self!r}: {exc!r}")
 
     def pause_writing(self) -> None:
-        self._paused = self._paused + 1
-        if self._paused == 1:
-            self._can_write.clear()
+        self._can_write.clear()
 
     def resume_writing(self) -> None:
-        assert self._paused > 0
-        self._paused = self._paused - 1
-        if self._paused == 0:
-            self._can_write.set()
+        self._can_write.set()
 
     async def drain(self) -> None:
         await self._can_write.wait()
@@ -156,7 +148,7 @@ class UdpServer(DrainableDatagramProtocol):
         sock = socket.socket(family=self._sock.family, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP)
         try:
             sock.setblocking(False)
-            sock.setsockopt(TransparentSocket.SOL_IP, TransparentSocket.IP_TRANSPARENT, 1)
+            sock.setsockopt(socket.SOL_IP, TransparentSocket.IP_TRANSPARENT, 1)
             sock.shutdown(socket.SHUT_RD)
             sock.bind(local_addr)
         except:
