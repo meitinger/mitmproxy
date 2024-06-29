@@ -31,6 +31,14 @@ class Question(serializable.SerializableDataclass):
     name: str
     type: int
     class_: int
+    _orig_data: bytes = None
+
+    def __setattr__(self, name, value):
+        # We try to preserve the request data for pointer safety,
+        # unless something gets changed by a hook.
+        if name != "_orig_data":
+            self._orig_data = None
+        return super().__setattr__(name, value)
 
     def __str__(self) -> str:
         return self.name
@@ -57,6 +65,14 @@ class ResourceRecord(serializable.SerializableDataclass):
     class_: int
     ttl: int
     data: bytes
+    _orig_data: bytes = None
+
+    def __setattr__(self, name, value):
+        # We try to preserve the request data for pointer safety,
+        # unless something gets changed by a hook.
+        if name != "_orig_data":
+            self._orig_data = None
+        return super().__setattr__(name, value)
 
     def __str__(self) -> str:
         try:
@@ -332,10 +348,19 @@ class Message(serializable.SerializableDataclass):
 
         for i in range(0, len_questions):
             try:
+                start_data = offset
                 name = unpack_domain_name()
                 type, class_ = Question.HEADER.unpack_from(buffer, offset)
                 offset += Question.HEADER.size
-                msg.questions.append(Question(name=name, type=type, class_=class_))
+                end_data = offset
+                msg.questions.append(
+                    Question(
+                        name=name,
+                        type=type,
+                        class_=class_,
+                        _orig_data=buffer[start_data:end_data],
+                    )
+                )
             except struct.error as e:
                 raise struct.error(f"question #{i}: {str(e)}")
 
@@ -345,6 +370,7 @@ class Message(serializable.SerializableDataclass):
             nonlocal buffer, offset
             for i in range(0, count):
                 try:
+                    start_data = offset
                     name = unpack_domain_name()
                     type, class_, ttl, len_data = ResourceRecord.HEADER.unpack_from(
                         buffer, offset
@@ -356,8 +382,12 @@ class Message(serializable.SerializableDataclass):
                             f"unpack requires a data buffer of {len_data} bytes"
                         )
                     data = buffer[offset:end_data]
-                    if 0b11000000 in data:
-                        # the resource record might contains a compressed domain name, if so, uncompressed in advance
+                    # RDATA might contain compressed domain names.
+                    # We handle simple records (CNAME, PTR, NS) here.
+                    # Complex records (MX, ...) aren't handled so far,
+                    # for those we try to preserve the request data,
+                    # which should keep the pointers intact.
+                    if type in (types.NS, types.CNAME, types.PTR):
                         try:
                             (
                                 rr_name,
@@ -365,11 +395,19 @@ class Message(serializable.SerializableDataclass):
                             ) = domain_names.unpack_from_with_compression(
                                 buffer, offset, cached_names
                             )
-                            if rr_name_len == len_data:
-                                data = domain_names.pack(rr_name)
+                            if rr_name_len != len_data:
+                                raise struct.error(
+                                    "compressed length doesn't match RR size"
+                                )
+                            data = domain_names.pack(rr_name)
                         except struct.error:
+                            # most likely an invalid record, but proceed anyway
                             pass
-                    section.append(ResourceRecord(name, type, class_, ttl, data))
+                    section.append(
+                        ResourceRecord(
+                            name, type, class_, ttl, data, buffer[start_data:end_data]
+                        )
+                    )
                     offset += len_data
                 except struct.error as e:
                     raise struct.error(f"{section_name} #{i}: {str(e)}")
@@ -421,14 +459,20 @@ class Message(serializable.SerializableDataclass):
         )
         # TODO implement compression
         for question in self.questions:
-            data.extend(domain_names.pack(question.name))
-            data.extend(Question.HEADER.pack(question.type, question.class_))
+            if question._orig_data is None:
+                data.extend(domain_names.pack(question.name))
+                data.extend(Question.HEADER.pack(question.type, question.class_))
+            else:
+                data.extend(question._orig_data)
         for rr in (*self.answers, *self.authorities, *self.additionals):
-            data.extend(domain_names.pack(rr.name))
-            data.extend(
-                ResourceRecord.HEADER.pack(rr.type, rr.class_, rr.ttl, len(rr.data))
-            )
-            data.extend(rr.data)
+            if rr._orig_data is None:
+                data.extend(domain_names.pack(rr.name))
+                data.extend(
+                    ResourceRecord.HEADER.pack(rr.type, rr.class_, rr.ttl, len(rr.data))
+                )
+                data.extend(rr.data)
+            else:
+                data.extend(rr._orig_data)
         return bytes(data)
 
     def to_json(self) -> dict:
